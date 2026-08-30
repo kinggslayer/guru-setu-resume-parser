@@ -1,0 +1,14 @@
+# Secrets must never enter the image — they're mounted at runtime instead.
+.env
+secrets/
+*.json
+!package.json
+
+__pycache__/
+*.pyc
+temp_resumes/
+.git/
+.gitignore
+*.xlsx
+.vscode/
+.DS_Store

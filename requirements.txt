@@ -1,0 +1,11 @@
+streamlit
+pandas
+openpyxl
+pdfplumber
+python-docx
+openai
+python-dotenv
+google-api-python-client
+google-auth
+google-auth-httplib2
+gspread

@@ -1,0 +1,17 @@
+.env
+symbolic-axe-502107-r1-2ff6db019a1f.json
+__pycache__/
+*.pyc
+temp_resumes/
+candidates.xlsx
+processed_cache.json
+content_hash_cache.json
+.vscode/
+.DS_Store
+Thumbs.db
+
+secrets/
+Caddyfile.local
+
+# Real secrets file — only the .example version is committed
+.streamlit/secrets.toml

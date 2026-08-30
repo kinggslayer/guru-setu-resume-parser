@@ -1,0 +1,22 @@
+# Settings that are safe on BOTH Streamlit Community Cloud and a VPS.
+#
+# Deliberately NO [server] address/port/headless here: Community Cloud
+# assigns its own port and runs the app itself, and a hard-coded port in
+# this file fights that and the deploy fails. Those flags live in the
+# Dockerfile's CMD instead, where they only apply to the VPS.
+
+[server]
+# Caddy forwards on the same origin, so the CSRF cookie check still works.
+# Turning this off is the usual cargo-cult fix for proxy problems and it
+# removes a real protection — leave it on.
+enableXsrfProtection = true
+enableCORS = true
+
+# Resumes are small; this caps a runaway upload.
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"

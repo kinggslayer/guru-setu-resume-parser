@@ -1,0 +1,32 @@
+# Replace with the subdomain you point at the Hostinger VPS.
+parser.gurusetuconsultancy.com {
+
+	# The app has no login of its own, and it holds candidate names,
+	# phone numbers and CV links. Without this, anyone who finds the URL
+	# can read that data and spend your OpenAI credits.
+	#
+	# Generate the hash on the server (it prompts for the password):
+	#     docker run --rm -it caddy:2-alpine caddy hash-password
+	# then paste the output below, replacing REPLACE_WITH_BCRYPT_HASH.
+	basic_auth {
+		sandeep REPLACE_WITH_BCRYPT_HASH
+	}
+
+	# Streamlit talks over WebSockets; reverse_proxy upgrades them
+	# automatically, so no extra config is needed for that.
+	reverse_proxy parser:8501 {
+		# Long-running parse jobs must not be cut off mid-run.
+		transport http {
+			read_timeout 30m
+		}
+	}
+
+	encode gzip
+
+	log {
+		output file /data/access.log {
+			roll_size 10mb
+			roll_keep 5
+		}
+	}
+}

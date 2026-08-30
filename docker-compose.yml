@@ -1,0 +1,43 @@
+services:
+
+  parser:
+    build: .
+    restart: unless-stopped
+
+    environment:
+      # Read from the .env file sitting next to this compose file.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?set OPENAI_API_KEY in .env}
+      OPENAI_WORKERS: ${OPENAI_WORKERS:-2}
+      # Path INSIDE the container — see the mount below.
+      GOOGLE_SERVICE_ACCOUNT_FILE: /app/secrets/service_account.json
+
+    volumes:
+      # The Google service-account key stays on the server and is never
+      # baked into the image. Read-only: the app only ever reads it.
+      - ./secrets/service_account.json:/app/secrets/service_account.json:ro
+
+    # No ports published to the host. Caddy is the only way in, which
+    # means the basic-auth check below cannot be bypassed by hitting
+    # port 8501 directly on the server's public IP.
+    expose:
+      - "8501"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+    depends_on:
+      - parser
+
+volumes:
+  caddy_data:
+  caddy_config:
