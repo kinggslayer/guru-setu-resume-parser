@@ -7,6 +7,8 @@ from docx import Document
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
+import io
+import base64
 
 from portal_vocab import (
     GRADE_LEVELS,
@@ -218,6 +220,104 @@ def read_pdf(file, char_limit=8000):
                 break
 
     return text
+
+
+# --------------------------------------------------------------------------
+#  OCR for scanned resumes
+#
+#  A scanned or photographed CV has no text layer, so pdfplumber returns
+#  nothing. Rather than skipping those candidates, the pages are rendered to
+#  images and transcribed by the same vision-capable model already in use.
+#
+#  This deliberately produces TEXT and hands it back to the normal pipeline,
+#  so the regex fallbacks, qualification parsing and content-hash dedup all
+#  behave exactly as they do for a text PDF.
+# --------------------------------------------------------------------------
+
+OCR_MAX_PAGES = 3
+
+# 2x the PDF's native size lands around 144 DPI — enough for the model to
+# read a phone number reliably, without producing huge images.
+OCR_RENDER_SCALE = 2
+
+
+def render_pdf_pages(file_path, max_pages=OCR_MAX_PAGES, scale=OCR_RENDER_SCALE):
+    """Render the first pages of a PDF to base64 PNGs."""
+
+    import pypdfium2
+
+    images = []
+
+    pdf = pypdfium2.PdfDocument(file_path)
+
+    try:
+
+        for index in range(min(len(pdf), max_pages)):
+
+            bitmap = pdf[index].render(scale=scale)
+            image = bitmap.to_pil()
+
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+
+            images.append(
+                base64.b64encode(buffer.getvalue()).decode("utf-8")
+            )
+
+    finally:
+        pdf.close()
+
+    return images
+
+
+def ocr_pdf(file_path):
+    """
+    Transcribe a scanned PDF to plain text. Returns "" on any failure, so
+    the caller just sees an unreadable document rather than an exception.
+    """
+
+    try:
+        images = render_pdf_pages(file_path)
+
+    except Exception as e:
+        print(f"[OCR] Could not render {file_path}: {e}", flush=True)
+        return ""
+
+    if not images:
+        return ""
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "Transcribe this resume exactly as written, preserving the "
+                "reading order. Include every email address, phone number, "
+                "qualification, school name and date. Output only the "
+                "transcribed text, with no commentary and no markdown."
+            )
+        }
+    ]
+
+    for image in images:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{image}"}
+        })
+
+    try:
+
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": content}],
+            temperature=0,
+            max_tokens=3000
+        )
+
+        return response.choices[0].message.content or ""
+
+    except Exception as e:
+        print(f"[OCR] Transcription failed: {type(e).__name__}: {e}", flush=True)
+        return ""
 
 
 def _iter_block_text(container):

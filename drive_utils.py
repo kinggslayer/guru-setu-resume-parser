@@ -80,7 +80,12 @@ def get_files_from_folder(folder_url, service=None):
 
         results = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
-            fields="nextPageToken, files(id,name,mimeType)",
+            # md5Checksum is computed by Drive itself, so byte-identical
+            # copies can be spotted without downloading anything.
+            fields=(
+                "nextPageToken, "
+                "files(id,name,mimeType,md5Checksum,size,createdTime)"
+            ),
             pageSize=1000,
             pageToken=page_token
         ).execute()
@@ -229,3 +234,128 @@ def upload_cache_to_drive(folder_id, file_name, json_text, service=None):
             fields="id"
         ).execute()
         return created["id"]
+
+def download_bytes_from_drive(folder_id, file_name, service=None):
+    """
+    Raw bytes of file_name from a Drive folder, or None if it isn't there
+    yet. Used for the master workbook, which is binary rather than JSON.
+    """
+
+    if service is None:
+        service = get_drive_service()
+
+    file_id = _find_file_in_folder(service, folder_id, file_name)
+
+    if file_id is None:
+        return None
+
+    request = service.files().get_media(fileId=file_id)
+
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+
+    return buf.getvalue()
+
+
+def upload_bytes_to_drive(folder_id, file_name, data, mimetype, service=None):
+    """
+    Create or UPDATE file_name in folder_id. Updating in place matters for
+    the master database: creating each time would leave a trail of files
+    all called the same thing, and the next run would pick one at random.
+    """
+
+    if service is None:
+        service = get_drive_service()
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(data),
+        mimetype=mimetype,
+        resumable=False
+    )
+
+    existing_id = _find_file_in_folder(service, folder_id, file_name)
+
+    if existing_id:
+        service.files().update(
+            fileId=existing_id,
+            media_body=media
+        ).execute()
+        return existing_id
+
+    created = service.files().create(
+        body={"name": file_name, "parents": [folder_id]},
+        media_body=media,
+        fields="id"
+    ).execute()
+
+    return created["id"]
+
+
+def get_file_metadata(file_id, service=None):
+    """Name and mimeType for a file id, used to sanity-check the master."""
+
+    if service is None:
+        service = get_drive_service()
+
+    return service.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType"
+    ).execute()
+
+
+def download_bytes_by_id(file_id, service=None):
+    """Raw bytes of a Drive file by id."""
+
+    if service is None:
+        service = get_drive_service()
+
+    request = service.files().get_media(fileId=file_id)
+
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+
+    return buf.getvalue()
+
+
+def upload_bytes_by_id(file_id, data, mimetype, service=None):
+    """Replace the contents of an existing Drive file, in place."""
+
+    if service is None:
+        service = get_drive_service()
+
+    media = MediaIoBaseUpload(
+        io.BytesIO(data),
+        mimetype=mimetype,
+        resumable=False
+    )
+
+    return service.files().update(
+        fileId=file_id,
+        media_body=media
+    ).execute()
+
+
+def trash_file(file_id, service=None):
+    """
+    Move a file to the Drive trash.
+
+    Deliberately NOT files().delete(), which is permanent and unrecoverable.
+    Trashed files sit in Drive's bin for 30 days, so a wrong call here can
+    be undone by the user.
+    """
+
+    if service is None:
+        service = get_drive_service()
+
+    return service.files().update(
+        fileId=file_id,
+        body={"trashed": True}
+    ).execute()
