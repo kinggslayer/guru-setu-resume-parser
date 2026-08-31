@@ -15,3 +15,7 @@ Caddyfile.local
 
 # Real secrets file — only the .example version is committed
 .streamlit/secrets.toml
+
+# OAuth files for cleanup_duplicates.py — never commit these
+client_secret.json
+token.json
