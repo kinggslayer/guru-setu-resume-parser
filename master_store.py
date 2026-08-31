@@ -31,7 +31,11 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from portal_export import PORTAL_COLUMNS, to_portal_dataframe
+from portal_export import (
+    PORTAL_COLUMNS,
+    to_portal_dataframe,
+    drop_same_teacher,
+)
 from drive_utils import (
     download_bytes_from_drive,
     upload_bytes_to_drive,
@@ -298,9 +302,23 @@ def to_master_rows(records):
 
 def merge_into_master(master_df, new_df):
     """
-    Append new rows, then drop any row whose file id or content hash already
-    appears earlier. Existing rows always win, so a manual correction made
-    in the master workbook is never overwritten by a re-parse.
+    Append new rows, then collapse duplicates on three levels. Existing rows
+    always win, so a manual correction made in the master workbook is never
+    overwritten by a re-parse.
+
+    All three levels are needed, because each catches something the others
+    miss:
+
+      Source File ID  - the same Drive file parsed again
+      Content Hash    - the same CV re-uploaded under a different name
+      person          - the SAME PERSON arriving from two files that are
+                        neither byte-identical nor textually identical, e.g.
+                        a CV re-exported from Word, or a scan whose OCR came
+                        out slightly differently on a second pass. Both get
+                        distinct hashes, so only a name+phone check catches
+                        them. This uses the portal's own isSameTeacher rule
+                        via drop_same_teacher, so the parser and the portal
+                        agree on what a duplicate person is.
     """
 
     if new_df.empty:
@@ -323,6 +341,10 @@ def merge_into_master(master_df, new_df):
         keyed = keyed.drop_duplicates(subset=[column], keep="first")
 
         combined = pd.concat([keyed, unkeyed], ignore_index=True)
+
+    # Person-level pass, last: file-level keys are more specific, so let
+    # them decide first and only then collapse what remains by identity.
+    combined = drop_same_teacher(combined)
 
     added = len(combined) - len(master_df)
 
