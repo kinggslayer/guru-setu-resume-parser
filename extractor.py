@@ -842,8 +842,36 @@ Resume:
             err_str = str(e)
             last_error = f"{type(e).__name__}: {err_str}"
 
-            is_rate_limit = "429" in err_str or "rate_limit" in err_str.lower()
+            lower_err = err_str.lower()
+
+            # A 429 usually means "slow down", which is worth retrying. But
+            # an exhausted balance, a revoked key or a missing model also
+            # surface as errors that will NEVER succeed on a retry — backing
+            # off four times just makes the app look frozen for minutes.
+            is_permanent = any(
+                marker in lower_err
+                for marker in (
+                    "insufficient_quota",
+                    "credit_balance_exhausted",
+                    "billing_hard_limit_reached",
+                    "invalid_api_key",
+                    "incorrect api key",
+                    "account_deactivated",
+                    "model_not_found",
+                    "does not exist or you do not have access",
+                )
+            )
+
+            is_rate_limit = (
+                not is_permanent
+                and ("429" in err_str or "rate_limit" in lower_err)
+            )
+
             is_parse_error = isinstance(e, json.JSONDecodeError)
+
+            if is_permanent:
+                extraction_failed = True
+                break
 
             if (is_rate_limit or is_parse_error) and attempt < max_attempts - 1:
 
