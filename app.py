@@ -305,7 +305,10 @@ def render_duplicate_cleanup():
     for group in groups:
         for duplicate in group["duplicates"]:
 
-            can_trash = duplicate.get("capabilities", {}).get("canTrash")
+            capabilities = duplicate.get("capabilities", {})
+
+            can_trash = capabilities.get("canTrash")
+            can_edit = capabilities.get("canEdit")
 
             owner = "unknown"
             owners = duplicate.get("owners") or []
@@ -314,7 +317,7 @@ def render_duplicate_cleanup():
                 owner = owners[0].get("emailAddress", "unknown")
 
             if can_trash is False:
-                blocked.append((duplicate["name"], owner))
+                blocked.append((duplicate["name"], owner, can_edit, duplicate["id"]))
 
             rows.append({
                 "Duplicate (will be trashed)": duplicate["name"],
@@ -326,18 +329,40 @@ def render_duplicate_cleanup():
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
     if blocked:
-        owners = sorted({owner for _, owner in blocked})
 
-        st.error(
-            f"{len(blocked)} of these can't be trashed by this app. On "
-            "Drive only a file's **owner** can trash it — Editor access is "
-            "not enough.\n\n"
-            f"Owned by: {', '.join(owners)}\n\n"
-            "Either delete them from that account, or select all the CVs in "
-            "Drive, choose **Make a copy**, move the copies into a folder in "
-            "your own Drive, and point the app at that folder. You'll own "
-            "those, so trashing and saving the master will both work."
-        )
+        # canEdit separates the two very different causes. Without it the
+        # advice is a guess, and the wrong guess wastes the user's time.
+        read_only = [b for b in blocked if b[2] is False]
+
+        if read_only:
+            st.error(
+                f"{len(read_only)} file(s) are shared with the app as "
+                "**Viewer**. Right-click the folder in Drive -> Share -> "
+                "change the service account to **Editor**, then re-run."
+            )
+
+        else:
+            owners = sorted({owner for _, owner, _, _ in blocked})
+
+            st.warning(
+                f"These files are owned by **{', '.join(owners)}** — your own "
+                "account — and Drive only lets the *owner* move a file to "
+                "trash. The app has edit access but cannot delete on your "
+                "behalf, so you'll need to remove these yourself.\n\n"
+                "It's one click each:"
+            )
+
+            for name, _, _, file_id in blocked:
+                st.markdown(
+                    f"- [{name}](https://drive.google.com/file/d/{file_id}/view) "
+                    "— open, then use the bin icon"
+                )
+
+            st.caption(
+                "Nothing breaks if you leave them. Duplicates are already "
+                "excluded from parsing, so they cost you nothing — deleting "
+                "them just tidies the folder."
+            )
 
     st.caption(
         "The copy already recorded in the master database is always the one "
