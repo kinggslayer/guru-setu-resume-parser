@@ -370,8 +370,26 @@ def render_duplicate_cleanup():
         "resume and pay for it again."
     )
 
+    # Drive already told us which files it will refuse, via canTrash. Only
+    # offer the button for the ones that can actually be trashed — clicking
+    # a button that is certain to fail is worse than not showing it.
+    trashable = [
+        duplicate
+        for group in groups
+        for duplicate in group["duplicates"]
+        if duplicate.get("capabilities", {}).get("canTrash") is not False
+    ]
+
+    if not trashable:
+        st.info(
+            "None of these can be trashed by the app, for the reason above. "
+            "Use the links to remove them yourself, or leave them — they "
+            "are already excluded from parsing and cost nothing."
+        )
+        return
+
     confirm = st.checkbox(
-        f"Yes, move these {duplicate_count} file(s) to my Drive trash",
+        f"Yes, move these {len(trashable)} file(s) to my Drive trash",
         key="dup_confirm"
     )
 
@@ -380,15 +398,14 @@ def render_duplicate_cleanup():
         trashed = 0
         failures = []
 
-        for group in groups:
-            for duplicate in group["duplicates"]:
+        for duplicate in trashable:
 
-                try:
-                    trash_file(duplicate["id"])
-                    trashed += 1
+            try:
+                trash_file(duplicate["id"])
+                trashed += 1
 
-                except Exception as e:
-                    failures.append(f"{duplicate['name']}: {e}")
+            except Exception as e:
+                failures.append((duplicate, str(e)))
 
         if trashed:
             st.success(
@@ -398,33 +415,60 @@ def render_duplicate_cleanup():
 
         if failures:
 
-            permission_denied = any(
-                "insufficientFilePermissions" in f or "403" in f
-                for f in failures
-            )
+            denied = [
+                (duplicate, message)
+                for duplicate, message in failures
+                if "insufficientFilePermissions" in message or "403" in message
+            ]
 
-            if permission_denied:
-                st.error(
-                    "Google refused to trash these files — the service "
-                    "account isn't allowed to modify them.\n\n"
-                    "Two possible causes:\n\n"
-                    "1. The folder is shared with the service account as "
-                    "**Viewer**. Change it to **Editor**.\n\n"
-                    "2. Someone else **owns** the files. On Drive only the "
-                    "owner can trash a file — Editor access is not enough. "
-                    "If these CVs were shared into your Drive by another "
-                    "account, delete the copies from that account, or make "
-                    "your own copies (select all -> Make a copy) so you own "
-                    "them, and point the app at the folder holding those."
-                )
+            if denied:
+                # canEdit separates the two causes; guessing wastes time.
+                read_only = [
+                    d for d, _ in denied
+                    if d.get("capabilities", {}).get("canEdit") is False
+                ]
 
-            else:
+                if read_only:
+                    st.error(
+                        f"{len(read_only)} file(s) are shared with the app as "
+                        "**Viewer**. In Drive: right-click the folder -> "
+                        "Share -> change the service account to **Editor**, "
+                        "then re-run."
+                    )
+
+                else:
+                    st.warning(
+                        "Drive only lets a file's **owner** move it to trash, "
+                        "and the app is a separate account from your Gmail — "
+                        "so it can read and edit these, but not delete them. "
+                        "Remove them yourself; it's one click each:"
+                    )
+
+                    for duplicate, _ in denied:
+                        st.markdown(
+                            f"- [{duplicate['name']}]"
+                            f"(https://drive.google.com/file/d/"
+                            f"{duplicate['id']}/view) — open, then the bin icon"
+                        )
+
+                    st.caption(
+                        "Or leave them. Duplicates are excluded before any "
+                        "download or API call, so they cost you nothing."
+                    )
+
+            other = [
+                f"{d['name']}: {m}" for d, m in failures
+                if (d, m) not in denied
+            ]
+
+            if other:
                 st.error(
                     "Could not trash some files:\n\n"
-                    + "\n\n".join(f"- {f}" for f in failures)
+                    + "\n\n".join(f"- {f}" for f in other)
                 )
 
-        st.session_state.pop("dup_groups", None)
+        if trashed:
+            st.session_state.pop("dup_groups", None)
 
 
 def render_bottom_panels():
