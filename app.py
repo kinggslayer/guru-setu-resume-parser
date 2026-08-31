@@ -14,6 +14,7 @@ from drive_utils import (
     download_file,
     extract_folder_id,
     trash_file,
+    has_user_credentials,
 )
 
 from duplicates import find_duplicate_groups, summarise
@@ -328,7 +329,7 @@ def render_duplicate_cleanup():
 
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-    if blocked:
+    if blocked and not has_user_credentials():
 
         # canEdit separates the two very different causes. Without it the
         # advice is a guess, and the wrong guess wastes the user's time.
@@ -370,23 +371,44 @@ def render_duplicate_cleanup():
         "resume and pay for it again."
     )
 
-    # Drive already told us which files it will refuse, via canTrash. Only
-    # offer the button for the ones that can actually be trashed — clicking
-    # a button that is certain to fail is worse than not showing it.
-    trashable = [
+    all_duplicates = [
         duplicate
         for group in groups
         for duplicate in group["duplicates"]
-        if duplicate.get("capabilities", {}).get("canTrash") is not False
     ]
+
+    # canTrash was reported for the SERVICE ACCOUNT. When the user's own
+    # OAuth credentials are configured the deletion runs as them instead,
+    # so that verdict no longer applies and everything is trashable.
+    as_user = has_user_credentials()
+
+    if as_user:
+        trashable = all_duplicates
+
+    else:
+        # Drive already said which files it will refuse. Offering a button
+        # that is certain to fail is worse than not showing it.
+        trashable = [
+            duplicate
+            for duplicate in all_duplicates
+            if duplicate.get("capabilities", {}).get("canTrash") is not False
+        ]
 
     if not trashable:
         st.info(
-            "None of these can be trashed by the app, for the reason above. "
-            "Use the links to remove them yourself, or leave them — they "
-            "are already excluded from parsing and cost nothing."
+            "The app can't trash these itself — it signs in as the service "
+            "account, and Drive only lets a file's owner delete it.\n\n"
+            "Use the links above to remove them, or enable in-app deletion "
+            "by running `python cleanup_duplicates.py --setup` once and "
+            "pasting the result into Settings -> Secrets."
         )
         return
+
+    if as_user:
+        st.caption(
+            "Deleting as your own Google account, so these can be removed "
+            "from here."
+        )
 
     confirm = st.checkbox(
         f"Yes, move these {len(trashable)} file(s) to my Drive trash",

@@ -51,7 +51,7 @@ CLIENT_SECRET_FILE = "client_secret.json"
 TOKEN_FILE = "token.json"
 
 
-def get_service():
+def get_credentials():
     """Sign in as the user, reusing the saved token when it's still good."""
 
     creds = None
@@ -81,7 +81,13 @@ def get_service():
         with open(TOKEN_FILE, "w", encoding="utf-8") as handle:
             handle.write(creds.to_json())
 
-    return build("drive", "v3", credentials=creds)
+    return creds
+
+
+def get_service():
+    """A Drive client authenticated as the user."""
+
+    return build("drive", "v3", credentials=get_credentials())
 
 
 def folder_id_from(link):
@@ -122,11 +128,52 @@ def list_files(service, folder_id):
     return files
 
 
+def print_secrets_block(creds):
+    """
+    Print the OAuth values to paste into the Streamlit app's secrets, so
+    the app's own delete button can act as the user from then on.
+
+    The refresh token is long-lived: mint it once here, and the app can
+    renew access tokens from it without ever showing a sign-in prompt.
+    """
+
+    if not creds.refresh_token:
+        sys.exit(
+            "Google didn't return a refresh token. Delete token.json and "
+            "run this again — the token is only issued on a fresh consent."
+        )
+
+    print()
+    print("=" * 68)
+    print("  Paste this into the app: Settings -> Secrets")
+    print("  Then the app's 'Move duplicates to trash' button will work.")
+    print("=" * 68)
+    print()
+    print(f'GOOGLE_OAUTH_CLIENT_ID = "{creds.client_id}"')
+    print(f'GOOGLE_OAUTH_CLIENT_SECRET = "{creds.client_secret}"')
+    print(f'GOOGLE_OAUTH_REFRESH_TOKEN = "{creds.refresh_token}"')
+    print()
+    print("=" * 68)
+    print("  Keep these private — they let the holder act as your Google")
+    print("  account. Never commit them to GitHub.")
+    print("=" * 68)
+
+
 def main():
+
+    if "--setup" in sys.argv:
+        creds = get_credentials()
+        print_secrets_block(creds)
+        return
 
     if len(sys.argv) < 2:
         sys.exit(
-            "Usage: python cleanup_duplicates.py <folder-link> [--delete]"
+            "Usage:\n"
+            "  python cleanup_duplicates.py --setup            "
+            "# print secrets for the web app\n"
+            "  python cleanup_duplicates.py <folder-link>      "
+            "# preview duplicates\n"
+            "  python cleanup_duplicates.py <folder-link> --delete"
         )
 
     link = sys.argv[1]

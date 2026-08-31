@@ -355,15 +355,89 @@ def trash_file(file_id, service=None):
     """
     Move a file to the Drive trash.
 
+    Prefers the user's own credentials when configured, because the service
+    account cannot trash files it does not own — which is every file the
+    user uploaded themselves.
+
     Deliberately NOT files().delete(), which is permanent and unrecoverable.
     Trashed files sit in Drive's bin for 30 days, so a wrong call here can
     be undone by the user.
     """
 
     if service is None:
-        service = get_drive_service()
+        service = get_user_drive_service() or get_drive_service()
 
     return service.files().update(
         fileId=file_id,
         body={"trashed": True}
     ).execute()
+
+
+# ---------------------------------------------------------------------------
+#  Acting as the user, rather than as the service account
+#
+#  Drive only lets a file's OWNER trash it, and the service account is a
+#  separate identity from the user's Gmail — so it can read and edit the
+#  resumes but can never delete them.
+#
+#  If the user supplies OAuth credentials of their own, Drive calls that need
+#  ownership are made as them instead. Minting the refresh token is a one-off,
+#  done by cleanup_duplicates.py, which prints the block to paste into
+#  Settings -> Secrets.
+# ---------------------------------------------------------------------------
+
+USER_OAUTH_KEYS = (
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "GOOGLE_OAUTH_CLIENT_SECRET",
+    "GOOGLE_OAUTH_REFRESH_TOKEN",
+)
+
+
+def _oauth_setting(name):
+
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+
+    except Exception:
+        pass
+
+    return os.getenv(name)
+
+
+def has_user_credentials():
+    """True when all three OAuth values are configured."""
+
+    return all(_oauth_setting(key) for key in USER_OAUTH_KEYS)
+
+
+def get_user_drive_service():
+    """
+    A Drive client authenticated as the user.
+
+    Returns None when OAuth isn't configured, so callers can fall back to
+    the service account rather than crash.
+    """
+
+    if not has_user_credentials():
+        return None
+
+    if getattr(_thread_local, "user_service", None) is not None:
+        return _thread_local.user_service
+
+    from google.oauth2.credentials import Credentials
+
+    creds = Credentials(
+        token=None,
+        refresh_token=_oauth_setting("GOOGLE_OAUTH_REFRESH_TOKEN"),
+        client_id=_oauth_setting("GOOGLE_OAUTH_CLIENT_ID"),
+        client_secret=_oauth_setting("GOOGLE_OAUTH_CLIENT_SECRET"),
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SCOPES,
+    )
+
+    service = build("drive", "v3", credentials=creds)
+
+    _thread_local.user_service = service
+
+    return service
