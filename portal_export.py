@@ -321,9 +321,13 @@ def drop_same_teacher(df):
         return df
 
     seen = set()
+
+    # Positions, not index labels: the frame may carry duplicate labels
+    # after a merge, and selecting by label would return every row sharing
+    # it — multiplying rows instead of filtering them.
     keep = []
 
-    for index, row in df.iterrows():
+    for position, (_, row) in enumerate(df.iterrows()):
 
         raw_name = row.get("Full Name", "")
         name = "" if raw_name is None else str(raw_name).strip().lower()
@@ -336,7 +340,7 @@ def drop_same_teacher(df):
 
         if not name or not mobile:
             # Can't be judged a duplicate — always kept.
-            keep.append(index)
+            keep.append(position)
             continue
 
         key = (name, mobile)
@@ -345,11 +349,9 @@ def drop_same_teacher(df):
             continue
 
         seen.add(key)
-        keep.append(index)
+        keep.append(position)
 
-    # Renumber so the caller gets a clean range index (st.data_editor
-    # needs one, and a gappy index is confusing in any downstream use).
-    return df.loc[keep].reset_index(drop=True)
+    return df.iloc[keep].reset_index(drop=True)
 
 
 def write_portal_excel(records, path="guru_setu_teacher_import.xlsx"):

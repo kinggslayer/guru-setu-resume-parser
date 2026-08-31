@@ -199,9 +199,15 @@ def drop_blank_rows(df):
     def has_content(row):
         return any(cell(row, column) for column in identifying)
 
-    keep = [index for index, row in df.iterrows() if has_content(row)]
+    # Boolean mask, NOT df.loc[list_of_labels].
+    #
+    # After a merge the index carries duplicate labels (master and new rows
+    # both start at 0). Selecting by label then returns every row sharing
+    # that label, once per occurrence in the list — 5 rows can come back as
+    # 9. A mask is positional and can only ever shrink the frame.
+    mask = [has_content(row) for _, row in df.iterrows()]
 
-    return df.loc[keep]
+    return df[pd.Series(mask, index=df.index)]
 
 
 def empty_master():
@@ -462,7 +468,12 @@ def merge_into_master(master_df, new_df):
 
             kept.append(row)
 
-    combined = pd.DataFrame(kept, columns=columns) if kept else empty_master()
+    # ignore_index equivalent: drop the source labels so the result has a
+    # clean 0..n-1 index and no duplicates for anything downstream to trip on.
+    combined = (
+        pd.DataFrame(kept, columns=columns).reset_index(drop=True)
+        if kept else empty_master()
+    )
 
     combined = drop_blank_rows(combined).reset_index(drop=True)
 
