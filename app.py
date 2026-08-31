@@ -300,15 +300,44 @@ def render_duplicate_cleanup():
     )
 
     rows = []
+    blocked = []
 
     for group in groups:
         for duplicate in group["duplicates"]:
+
+            can_trash = duplicate.get("capabilities", {}).get("canTrash")
+
+            owner = "unknown"
+            owners = duplicate.get("owners") or []
+
+            if owners:
+                owner = owners[0].get("emailAddress", "unknown")
+
+            if can_trash is False:
+                blocked.append((duplicate["name"], owner))
+
             rows.append({
                 "Duplicate (will be trashed)": duplicate["name"],
                 "Keeping": group["keep"]["name"],
+                "Owner": owner,
+                "Can trash": "yes" if can_trash else "no",
             })
 
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    if blocked:
+        owners = sorted({owner for _, owner in blocked})
+
+        st.error(
+            f"{len(blocked)} of these can't be trashed by this app. On "
+            "Drive only a file's **owner** can trash it — Editor access is "
+            "not enough.\n\n"
+            f"Owned by: {', '.join(owners)}\n\n"
+            "Either delete them from that account, or select all the CVs in "
+            "Drive, choose **Make a copy**, move the copies into a folder in "
+            "your own Drive, and point the app at that folder. You'll own "
+            "those, so trashing and saving the master will both work."
+        )
 
     st.caption(
         "The copy already recorded in the master database is always the one "
@@ -388,6 +417,26 @@ def render_bottom_panels():
         file_name="guru_setu_teacher_import.xlsx",
         heading="Master database — review and download"
     )
+
+
+def blank_safe(value):
+    """
+    Text of a field that may be None, "None" or NaN, as a clean string.
+
+    Missing values must come back as "" so they are falsy. Anything that
+    turns a missing value into a non-empty string will make two records
+    that are both missing that field look identical to each other.
+    """
+
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+
+    if text.lower() in ("none", "nan", "null"):
+        return ""
+
+    return text
 
 
 def hash_text(text):
@@ -632,13 +681,21 @@ if st.button("Process Resumes"):
                     and not result.get("duplicate_of_content")
                 ):
 
-                    email = str(result.get("email", "")).strip().lower()
-                    phone = str(result.get("phone", "")).strip()
+                    # blank_safe, NOT str(...): result["email"] is None when
+                    # no address was found, and str(None) is the truthy
+                    # string "none" — which then matches every other record
+                    # that also had no email, silently dropping them.
+                    email = blank_safe(result.get("email")).lower()
+                    phone = blank_safe(result.get("phone"))
 
                     if (email and email in existing_emails) or (phone and phone in existing_phones):
 
                         st.warning(
-                            f"Skipping existing candidate: {result.get('full_name')}"
+                            "Skipping "
+                            f"{result.get('resume_file_name', 'a file')}: "
+                            f"{result.get('full_name') or '(no name)'} has the "
+                            "same email or phone as a resume already parsed "
+                            "in this run."
                         )
 
                         result["skipped_existing_contact"] = True
@@ -746,7 +803,27 @@ if st.button("Process Resumes"):
         # -----------------------------------------------------------------
         new_rows = to_master_rows(unique_results)
 
-        master_df, added = merge_into_master(master_df, new_rows)
+        master_df, added, merge_report = merge_into_master(master_df, new_rows)
+
+        if merge_report:
+            st.warning(
+                f"{len(merge_report)} row(s) were merged as duplicates. "
+                "If any of these are actually different people, tell me — "
+                "the rule is name + phone, matching the portal's own."
+            )
+
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Dropped": item["dropped"],
+                        "Because": item["reason"],
+                        "Same as": item["matched"],
+                    }
+                    for item in merge_report
+                ]),
+                width="stretch",
+                hide_index=True
+            )
 
         try:
             save_master(folder_id, master_df, master_file_id)

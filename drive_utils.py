@@ -82,9 +82,17 @@ def get_files_from_folder(folder_url, service=None):
             q=f"'{folder_id}' in parents and trashed=false",
             # md5Checksum is computed by Drive itself, so byte-identical
             # copies can be spotted without downloading anything.
+            # md5Checksum is computed by Drive itself, so byte-identical
+            # copies can be spotted without downloading anything.
+            #
+            # capabilities/owners answer "why can't this be trashed?"
+            # definitively, instead of leaving the user to guess between
+            # wrong sharing level and wrong file owner.
             fields=(
                 "nextPageToken, "
-                "files(id,name,mimeType,md5Checksum,size,createdTime)"
+                "files(id,name,mimeType,md5Checksum,size,createdTime,"
+                "ownedByMe,capabilities(canTrash,canEdit),"
+                "owners(emailAddress))"
             ),
             pageSize=1000,
             pageToken=page_token

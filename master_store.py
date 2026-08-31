@@ -148,6 +148,29 @@ TRACKING_COLUMNS = [
 MASTER_COLUMNS = PORTAL_COLUMNS + TRACKING_COLUMNS
 
 
+def cell(row, column):
+    """
+    A cell's text, with missing values normalised to "".
+
+    Values read back from a workbook can be the literal strings "None" or
+    "nan" if an earlier version wrote them that way. Those must count as
+    empty: any non-empty stand-in makes two rows that are both missing the
+    field look identical, which silently merges unrelated candidates.
+    """
+
+    value = row.get(column, "")
+
+    if value is None:
+        return ""
+
+    text = str(value).strip()
+
+    if text.lower() in ("none", "nan", "null"):
+        return ""
+
+    return text
+
+
 def drop_blank_rows(df):
     """
     Remove rows where every cell is empty. A row counts as real if it has
@@ -174,11 +197,7 @@ def drop_blank_rows(df):
         return df
 
     def has_content(row):
-        return any(
-            str(row.get(column, "")).strip()
-            and str(row.get(column, "")).strip().lower() != "nan"
-            for column in identifying
-        )
+        return any(cell(row, column) for column in identifying)
 
     keep = [index for index, row in df.iterrows() if has_content(row)]
 
@@ -345,59 +364,111 @@ def to_master_rows(records):
     return portal_df
 
 
+def _mobile(value):
+    """Last 10 digits, matching the portal's localMobile()."""
+
+    digits = "".join(c for c in str(value or "") if c.isdigit())
+
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
 def merge_into_master(master_df, new_df):
     """
-    Append new rows, then collapse duplicates on three levels. Existing rows
-    always win, so a manual correction made in the master workbook is never
+    Append new rows, dropping duplicates on three levels. Existing rows
+    always win, so a manual correction in the master workbook is never
     overwritten by a re-parse.
 
-    All three levels are needed, because each catches something the others
-    miss:
+    Each level catches something the others miss:
 
       Source File ID  - the same Drive file parsed again
       Content Hash    - the same CV re-uploaded under a different name
-      person          - the SAME PERSON arriving from two files that are
-                        neither byte-identical nor textually identical, e.g.
-                        a CV re-exported from Word, or a scan whose OCR came
-                        out slightly differently on a second pass. Both get
-                        distinct hashes, so only a name+phone check catches
-                        them. This uses the portal's own isSameTeacher rule
-                        via drop_same_teacher, so the parser and the portal
-                        agree on what a duplicate person is.
+      name + phone    - the SAME PERSON from two files that are neither
+                        byte-identical nor textually identical (a CV
+                        re-exported from Word, or a scan whose OCR came out
+                        differently). Uses the portal's isSameTeacher rule
+                        so the parser and portal agree.
+
+    Returns (combined, added, report). The report explains every dropped
+    row — without it a shrinking candidate count looks like data loss.
     """
 
     if new_df.empty:
-        return master_df, 0
+        return master_df, 0, []
 
-    combined = pd.concat([master_df, new_df], ignore_index=True)
+    columns = list(master_df.columns) or list(new_df.columns)
 
-    before = len(combined)
+    seen_ids = {}
+    seen_hashes = {}
+    seen_people = {}
 
-    for column in (SOURCE_FILE_ID, CONTENT_HASH):
+    kept = []
+    report = []
 
-        # Blank values must not collapse together — pandas treats them as
-        # equal, which would silently delete distinct candidates whose
-        # tracking data is missing.
-        has_value = combined[column].astype(str).str.strip() != ""
+    def label(row):
+        name = cell(row, "Full Name")
+        phone = cell(row, "Phone")
+        source = cell(row, SOURCE_FILE_NAME)
+        return f"{name or '(no name)'} {phone}".strip() + (
+            f" [{source}]" if source else ""
+        )
 
-        keyed = combined[has_value]
-        unkeyed = combined[~has_value]
+    for origin, frame in (("master", master_df), ("new", new_df)):
 
-        keyed = keyed.drop_duplicates(subset=[column], keep="first")
+        for _, row in frame.iterrows():
 
-        combined = pd.concat([keyed, unkeyed], ignore_index=True)
+            file_id = cell(row, SOURCE_FILE_ID)
+            content = cell(row, CONTENT_HASH)
 
-    # Person-level pass, last: file-level keys are more specific, so let
-    # them decide first and only then collapse what remains by identity.
-    combined = drop_same_teacher(combined)
+            name = cell(row, "Full Name").lower()
+            mobile = _mobile(cell(row, "Phone"))
 
-    # Never store a row the portal would reject. Cheap here, and it stops
-    # junk accumulating in the master across runs.
+            person = (name, mobile) if name and mobile else None
+
+            # Blank keys must never match each other, or unrelated rows
+            # with missing data would collapse into one.
+            if file_id and file_id in seen_ids:
+                if origin == "new":
+                    report.append({
+                        "dropped": label(row),
+                        "reason": "same Drive file already recorded",
+                        "matched": seen_ids[file_id],
+                    })
+                continue
+
+            if content and content in seen_hashes:
+                if origin == "new":
+                    report.append({
+                        "dropped": label(row),
+                        "reason": "identical text to another resume",
+                        "matched": seen_hashes[content],
+                    })
+                continue
+
+            if person and person in seen_people:
+                if origin == "new":
+                    report.append({
+                        "dropped": label(row),
+                        "reason": "same name and phone",
+                        "matched": seen_people[person],
+                    })
+                continue
+
+            if file_id:
+                seen_ids[file_id] = label(row)
+            if content:
+                seen_hashes[content] = label(row)
+            if person:
+                seen_people[person] = label(row)
+
+            kept.append(row)
+
+    combined = pd.DataFrame(kept, columns=columns) if kept else empty_master()
+
     combined = drop_blank_rows(combined).reset_index(drop=True)
 
-    added = len(combined) - len(master_df)
+    added = max(len(combined) - len(master_df), 0)
 
-    return combined, max(added, 0)
+    return combined, added, report
 
 
 def strip_tracking(df):

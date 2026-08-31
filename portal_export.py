@@ -325,7 +325,11 @@ def drop_same_teacher(df):
 
     for index, row in df.iterrows():
 
-        name = str(row.get("Full Name", "")).strip().lower()
+        raw_name = row.get("Full Name", "")
+        name = "" if raw_name is None else str(raw_name).strip().lower()
+
+        if name in ("none", "nan", "null"):
+            name = ""
 
         digits = "".join(c for c in str(row.get("Phone", "")) if c.isdigit())
         mobile = digits[-10:] if len(digits) >= 10 else ""
