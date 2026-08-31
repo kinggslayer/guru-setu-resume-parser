@@ -482,7 +482,92 @@ def merge_into_master(master_df, new_df):
     return combined, added, report
 
 
-def strip_tracking(df):
-    """Master -> exactly the portal's 29 columns, for the upload file."""
+def apply_edits(master_df, edited_df):
+    """
+    Write reviewed values from the grid back onto the master.
 
-    return df[[c for c in PORTAL_COLUMNS if c in df.columns]]
+    Matched on Source File ID, which the grid never shows and so can't be
+    changed — matching on name or phone would break precisely when those
+    are the fields being corrected.
+
+    Only the portal columns are copied across; tracking columns are left
+    alone so dedup keeps working. Rows added by hand in the grid have no
+    file id and are appended as new.
+    """
+
+    if edited_df is None or edited_df.empty:
+        return master_df, 0, 0
+
+    if SOURCE_FILE_ID not in master_df.columns:
+        return master_df, 0, 0
+
+    editable = [c for c in PORTAL_COLUMNS if c in edited_df.columns]
+
+    updated = master_df.copy()
+
+    # Position lookup by file id, so each edited row finds its master row.
+    positions = {}
+
+    for position, (_, row) in enumerate(updated.iterrows()):
+
+        file_id = cell(row, SOURCE_FILE_ID)
+
+        if file_id:
+            positions[file_id] = position
+
+    changed_rows = 0
+    appended = []
+
+    for _, edited_row in edited_df.iterrows():
+
+        file_id = cell(edited_row, SOURCE_FILE_ID)
+
+        if not file_id or file_id not in positions:
+
+            # A row typed straight into the grid — keep it if it's usable.
+            if any(cell(edited_row, c) for c in ("Full Name", "Email", "Phone")):
+                appended.append(edited_row)
+
+            continue
+
+        position = positions[file_id]
+        row_changed = False
+
+        for column in editable:
+
+            before = cell(updated.iloc[position], column)
+            after = cell(edited_row, column)
+
+            if before != after:
+                updated.iloc[
+                    position, updated.columns.get_loc(column)
+                ] = after
+                row_changed = True
+
+        if row_changed:
+            changed_rows += 1
+
+    if appended:
+        updated = pd.concat(
+            [updated, pd.DataFrame(appended)],
+            ignore_index=True
+        )
+
+    return updated, changed_rows, len(appended)
+
+
+def strip_tracking(df, keep_id=False):
+    """
+    Master -> exactly the portal's 29 columns, for the upload file.
+
+    keep_id retains Source File ID as a hidden key so grid edits can be
+    matched back to the right master row. It is dropped again before the
+    file is written, so the download still matches the import template.
+    """
+
+    columns = [c for c in PORTAL_COLUMNS if c in df.columns]
+
+    if keep_id and SOURCE_FILE_ID in df.columns:
+        columns = columns + [SOURCE_FILE_ID]
+
+    return df[columns]

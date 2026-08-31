@@ -19,6 +19,8 @@ from drive_utils import (
 
 from duplicates import find_duplicate_groups, summarise
 
+from usage import tracker
+
 from extractor import (
     read_pdf,
     read_docx,
@@ -32,6 +34,8 @@ from portal_export import to_portal_dataframe, drop_same_teacher
 from master_store import (
     extract_file_id,
     load_master,
+    save_master,
+    apply_edits,
     SOURCE_FILE_ID,
     save_master,
     already_seen,
@@ -45,6 +49,7 @@ from review import (
     add_review_column,
     count_flagged,
     strip_review_column,
+    review_issues,
     REVIEW_COLUMN
 )
 
@@ -95,8 +100,26 @@ if not OPENAI_API_KEY:
     st.stop()
 os.environ.setdefault("OPENAI_API_KEY", OPENAI_API_KEY)
 
-drive_link = st.text_input(
-    "Paste Google Drive Folder Link"
+drive_link = st.text_area(
+    "Google Drive folder link(s)",
+    height=80,
+    help="One per line to process several folders in one run."
+)
+
+include_subfolders = st.checkbox(
+    "Include sub-folders",
+    value=True,
+    help="Walks folders inside the one you paste."
+)
+
+uploaded_files = st.file_uploader(
+    "...or upload CVs directly",
+    type=["pdf", "docx"],
+    accept_multiple_files=True,
+    help=(
+        "For resumes that arrived by WhatsApp or email. These are parsed "
+        "alongside any Drive folders above."
+    )
 )
 
 
@@ -163,6 +186,34 @@ def to_excel_bytes(df):
     return buffer.getvalue()
 
 
+def folder_id_for_save():
+    """
+    The folder the master lives in, for saving.
+
+    Recomputed from the inputs rather than passed down: the review panels
+    render on every rerun, including ones where the Process button never
+    ran, so the button block's local variables aren't available here.
+    """
+
+    # drive_link may now hold several lines; the master goes in the first.
+    lines = [line.strip() for line in str(drive_link).splitlines() if line.strip()]
+
+    if not lines:
+        return None
+
+    try:
+        return extract_folder_id(lines[0])
+
+    except Exception:
+        return None
+
+
+def master_file_id_for_save():
+    """The pinned master file id, if one is configured."""
+
+    return extract_file_id(master_link)
+
+
 def render_review_and_download(state_key, file_name, heading):
     """
     Show the editable review grid for whatever is in st.session_state[state_key]
@@ -179,13 +230,60 @@ def render_review_and_download(state_key, file_name, heading):
         return
 
     # Hide the tracking columns: they're for dedup, not for editing, and
-    # showing them makes the grid far harder to scan.
-    df = strip_tracking(df)
+    # showing them makes the grid far harder to scan. The file id is kept
+    # (hidden in the editor) so edits can be matched back to master rows.
+    df = strip_tracking(df, keep_id=True)
 
     if REVIEW_COLUMN not in df.columns:
         df = add_review_column(df)
 
     st.subheader(heading)
+
+    # ------------------------------------------------------------------
+    #  Filter and search.
+    #
+    #  A master of a few thousand rows is unusable without these: finding
+    #  one teacher, or working through only the incomplete rows, otherwise
+    #  means scrolling.
+    # ------------------------------------------------------------------
+    total_rows = len(df)
+
+    controls = st.columns([2, 1])
+
+    with controls[0]:
+        query = st.text_input(
+            "Search",
+            key=f"search_{state_key}",
+            placeholder="Name, phone, email, city, subject..."
+        )
+
+    with controls[1]:
+        only_flagged = st.checkbox(
+            "Only rows needing review",
+            key=f"flagged_{state_key}"
+        )
+
+    if only_flagged:
+        df = df[[bool(review_issues(row)) for _, row in df.iterrows()]]
+
+    if query:
+        needle = query.strip().lower()
+
+        # Search across every column: the useful match might be a subject
+        # or a city, not just a name.
+        matches = [
+            any(needle in str(value).lower() for value in row.values)
+            for _, row in df.iterrows()
+        ]
+
+        df = df[matches]
+
+    if len(df) != total_rows:
+        st.caption(f"Showing {len(df)} of {total_rows} rows.")
+
+    if df.empty:
+        st.info("Nothing matches. Clear the search or filter to see the rest.")
+        return
 
     flagged_before = count_flagged(df)
 
@@ -241,6 +339,7 @@ def render_review_and_download(state_key, file_name, heading):
                 "College Type", options=[""] + COLLEGE_TYPES
             ),
             "CV URL": st.column_config.LinkColumn("CV URL"),
+            SOURCE_FILE_ID: None,
         }
     )
 
@@ -256,9 +355,66 @@ def render_review_and_download(state_key, file_name, heading):
     else:
         st.caption("Nothing outstanding.")
 
+    # ------------------------------------------------------------------
+    #  Save corrections back to Drive.
+    #
+    #  Without this, a phone fixed here is lost the moment the file is
+    #  downloaded: the master keeps the wrong value and the next run
+    #  reuses it.
+    # ------------------------------------------------------------------
+    if st.button("Save these corrections to the master database",
+                 key=f"save_{state_key}"):
+
+        target_folder = folder_id_for_save()
+        target_file = master_file_id_for_save()
+
+        if not target_folder and not target_file:
+            st.error(
+                "Nowhere to save to. Set the master database file in "
+                "Settings, or paste the Drive folder link above."
+            )
+            return
+
+        try:
+            updated, changed, appended = apply_edits(
+                st.session_state.get("master_df"),
+                strip_review_column(edited)
+            )
+
+            if not changed and not appended:
+                st.info("No changes to save.")
+
+            else:
+                save_master(target_folder, updated, target_file)
+
+                st.session_state["master_df"] = updated
+                st.session_state.pop(f"{state_key}__edited", None)
+
+                parts = []
+                if changed:
+                    parts.append(f"{changed} row(s) updated")
+                if appended:
+                    parts.append(f"{appended} row(s) added")
+
+                st.success(
+                    ", ".join(parts).capitalize()
+                    + " in the master database."
+                )
+
+        except Exception as e:
+            st.error(
+                f"Could not save: {e}\n\n"
+                "Your edits are still in the grid — download them now so "
+                "they aren't lost."
+            )
+
     # The review column is dropped so the file matches the import template
     # exactly, with no column the portal doesn't recognise.
     download_df = strip_review_column(edited)
+
+    # And the hidden key, so the file matches the import template exactly.
+    if SOURCE_FILE_ID in download_df.columns:
+        download_df = download_df.drop(columns=[SOURCE_FILE_ID])
 
     st.download_button(
         label=f"Download portal import file ({len(download_df)} teachers)",
@@ -585,7 +741,11 @@ def process_resume(file_info, output_dir, existing_hashes):
         data = extract_resume_data(text)
         data["content_hash"] = content_hash
         data["file_id"] = file_id
-        data["resume_link"] = f"https://drive.google.com/file/d/{file_id}/view"
+        # An uploaded file has no Drive page to link to.
+        data["resume_link"] = (
+            "" if str(file_id).startswith("upload-")
+            else f"https://drive.google.com/file/d/{file_id}/view"
+        )
         data["resume_file_name"] = file_name
         data["duplicate_of_content"] = False
         data["ocr_used"] = ocr_used
@@ -598,8 +758,10 @@ def process_resume(file_info, output_dir, existing_hashes):
 
 if st.button("Process Resumes"):
 
-    if not drive_link:
-        st.error("Please enter a Google Drive folder link.")
+    if not drive_link and not uploaded_files:
+        st.error(
+            "Paste a Google Drive folder link, or upload some CVs."
+        )
         st.stop()
 
     output_dir = "temp_resumes"
@@ -609,16 +771,81 @@ if st.button("Process Resumes"):
 
     os.makedirs(output_dir)
 
+    tracker.reset()
+
     st.write("Fetching files from Google Drive...")
 
-    try:
-        folder_id = extract_folder_id(drive_link)
+    links = [line.strip() for line in drive_link.splitlines() if line.strip()]
 
-    except ValueError as e:
-        st.error(f"{e}. Paste the folder URL from your browser's address bar.")
+    folder_ids = []
+
+    for link in links:
+
+        try:
+            folder_ids.append(extract_folder_id(link))
+
+        except ValueError:
+            st.error(
+                f"Not a Drive folder link: {link}\n\n"
+                "Paste the URL from your browser's address bar."
+            )
+            st.stop()
+
+    # The master is written to the first folder when no file is pinned.
+    folder_id = folder_ids[0] if folder_ids else None
+
+    if folder_id is None and not extract_file_id(master_link):
+        st.error(
+            "Uploads alone have nowhere to store the master database. "
+            "Either set the master file in Settings, or paste a Drive "
+            "folder link so one can be created there."
+        )
         st.stop()
 
-    files, skipped_files = get_files_from_folder(drive_link)
+    files = []
+    skipped_files = []
+
+    for link in links:
+
+        found, skipped = get_files_from_folder(
+            link, recursive=include_subfolders
+        )
+
+        files.extend(found)
+        skipped_files.extend(skipped)
+
+    # The same file can sit in two of the folders given; parse it once.
+    by_id = {}
+
+    for item in files:
+        by_id[item["id"]] = item
+
+    files = list(by_id.values())
+
+    if len(links) > 1:
+        st.write(f"Read {len(links)} folders.")
+
+    # Uploaded CVs are written straight to the work directory and given a
+    # synthetic id derived from their bytes — so re-uploading the same file
+    # is recognised as already parsed, exactly like a Drive file id.
+    for upload in uploaded_files or []:
+
+        data = upload.getvalue()
+
+        upload_id = "upload-" + hashlib.sha256(data).hexdigest()[:24]
+
+        with open(os.path.join(output_dir, upload.name), "wb") as handle:
+            handle.write(data)
+
+        files.append({
+            "id": upload_id,
+            "name": upload.name,
+            "mimeType": upload.type or "application/pdf",
+            "uploaded": True,
+        })
+
+    if uploaded_files:
+        st.write(f"{len(uploaded_files)} uploaded file(s) added.")
 
     if skipped_files:
         skipped_names = ", ".join(f["name"] for f in skipped_files)
@@ -737,6 +964,9 @@ if st.button("Process Resumes"):
     download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
     groq_executor = ThreadPoolExecutor(max_workers=OPENAI_WORKERS)
 
+    already_local = [f for f in files if f.get("uploaded")]
+    files = [f for f in files if not f.get("uploaded")]
+
     download_futures = {
         download_executor.submit(
             download_file, f["id"], f["name"], output_dir
@@ -745,6 +975,15 @@ if st.button("Process Resumes"):
     } if files else {}
 
     process_futures = {}
+
+    # Uploads need no download step, so they go straight to parsing.
+    for file_info in already_local:
+
+        process_futures[
+            groq_executor.submit(
+                process_resume, file_info, output_dir, existing_hashes
+            )
+        ] = file_info
 
     for future in as_completed(download_futures):
 
@@ -848,6 +1087,11 @@ if st.button("Process Resumes"):
             "read by transcribing the page images. Check those rows in the "
             "grid — transcription is less reliable than real text."
         )
+
+    cost_line = tracker.summary()
+
+    if cost_line:
+        st.caption(cost_line)
 
     needs_ocr = [r for r in results if r.get("needs_ocr")]
 

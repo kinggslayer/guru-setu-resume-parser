@@ -66,14 +66,66 @@ def extract_folder_id(folder_url):
     raise ValueError("Invalid Google Drive folder link")
 
 
-def get_files_from_folder(folder_url, service=None):
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def get_files_from_folder(folder_url, service=None, recursive=True):
+    """
+    Files in a Drive folder.
+
+    recursive walks sub-folders too. Organising CVs by batch or month is
+    the obvious thing to do, and without this those files are invisible —
+    the app reports "no files" on a folder that plainly has some.
+    """
 
     if service is None:
         service = get_drive_service()
 
-    folder_id = extract_folder_id(folder_url)
+    root_id = extract_folder_id(folder_url)
 
     all_files = []
+    seen_folders = set()
+    pending = [root_id]
+
+    while pending:
+
+        folder_id = pending.pop()
+
+        # Drive allows a folder to appear under several parents; without
+        # this guard that becomes an infinite loop.
+        if folder_id in seen_folders:
+            continue
+
+        seen_folders.add(folder_id)
+
+        for item in _list_folder(service, folder_id):
+
+            if item.get("mimeType") == FOLDER_MIME:
+
+                if recursive:
+                    pending.append(item["id"])
+
+                continue
+
+            all_files.append(item)
+
+    downloadable = [
+        f for f in all_files
+        if not f.get("mimeType", "").startswith(GOOGLE_NATIVE_MIME_PREFIX)
+    ]
+
+    skipped = [
+        f for f in all_files
+        if f.get("mimeType", "").startswith(GOOGLE_NATIVE_MIME_PREFIX)
+    ]
+
+    return downloadable, skipped
+
+
+def _list_folder(service, folder_id):
+    """Every direct child of one folder, following pagination."""
+
+    items = []
     page_token = None
 
     while True:
@@ -98,23 +150,14 @@ def get_files_from_folder(folder_url, service=None):
             pageToken=page_token
         ).execute()
 
-        all_files.extend(results.get("files", []))
+        items.extend(results.get("files", []))
 
         page_token = results.get("nextPageToken")
 
         if not page_token:
             break
-    downloadable = [
-        f for f in all_files
-        if not f.get("mimeType", "").startswith(GOOGLE_NATIVE_MIME_PREFIX)
-    ]
 
-    skipped = [
-        f for f in all_files
-        if f.get("mimeType", "").startswith(GOOGLE_NATIVE_MIME_PREFIX)
-    ]
-
-    return downloadable, skipped
+    return items
 
 
 def download_file(file_id, file_name, output_dir):

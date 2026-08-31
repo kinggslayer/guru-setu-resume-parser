@@ -10,6 +10,8 @@ import os
 import io
 import base64
 
+from usage import tracker
+
 from portal_vocab import (
     GRADE_LEVELS,
     SUBJECTS,
@@ -313,6 +315,8 @@ def ocr_pdf(file_path):
             max_tokens=3000
         )
 
+        tracker.record(response)
+
         return response.choices[0].message.content or ""
 
     except Exception as e:
@@ -438,55 +442,89 @@ def extract_experience(text):
     return None
 
 
+# Each entry: canonical name -> the spellings that mean it.
+#
+# Matching is by regex with word boundaries, NOT substring containment.
+# A plain "mba" in text.lower() matches inside "Bo(mba)y", so every
+# candidate who studied at IIT Bombay was recorded as holding an MBA.
+_QUALIFICATION_PATTERNS = [
+    ("PhD", [r"ph\.?\s?d\b", r"doctor of philosophy", r"\bdoctorate\b"]),
+    ("UGC NET", [r"ugc[\s-]*net\b"]),
+    ("CSIR-NET", [r"csir[\s-]*net\b"]),
+    ("NET", [r"\bnet\b"]),
+    ("JRF", [r"\bjrf\b"]),
+    ("GATE", [r"\bgate\b"]),
+
+    ("MBA", [r"\bm\.?\s?b\.?\s?a\b", r"master of business administration"]),
+    ("PGDM", [r"\bpgdm\b"]),
+    ("M.Tech", [r"\bm\.?\s?tech\b", r"master of technology",
+                r"master'?s? of engineering", r"\bm\.?\s?e\.?\s*\("]),
+    ("M.Ed", [r"\bm\.?\s?ed\b", r"master of education"]),
+    ("M.Sc", [r"\bm\.?\s?sc\b", r"master of science",
+              r"master'?s?\s+(?:of|in)\s+\w+"]),
+    ("M.A", [r"\bm\.?\s?a\b", r"master of arts"]),
+    ("M.Com", [r"\bm\.?\s?com\b", r"master of commerce"]),
+    ("MCA", [r"\bmca\b", r"master of computer applications?"]),
+    ("MBM", [r"\bmbm\b"]),
+
+    ("B.Tech", [r"\bb\.?\s?tech\b", r"bachelor of technology",
+                r"\bb\.?\s?e\.?\s*\(", r"bachelor of engineering"]),
+    ("B.Ed", [r"\bb\.?\s?ed\b", r"bachelor of education"]),
+    ("B.Sc", [r"\bb\.?\s?sc\b", r"bachelor of science"]),
+    ("B.A", [r"\bb\.?\s?a\b", r"bachelor of arts"]),
+    ("B.Com", [r"\bb\.?\s?com\b", r"bachelor of commerce"]),
+    ("BCA", [r"\bbca\b", r"bachelor of computer applications?"]),
+    ("BBA", [r"\bbba\b"]),
+
+    ("D.El.Ed", [r"\bd\.?\s?el\.?\s?ed\b", r"\bdeled\b"]),
+    ("D.T.Ed", [r"\bd\.?\s?t\.?\s?ed\b"]),
+    ("DSM", [r"\bdsm\b"]),
+
+    ("CTET", [r"\bctet\b"]),
+    ("TET", [r"\b(?<!c)tet\b", r"\bstate\s+tet\b"]),
+]
+
+# Where one qualification's text contains another's, listing both is noise:
+# "CTET qualified" should not also record a bare "TET".
+_QUALIFICATION_SUPERSEDES = {
+    "CTET": ["TET"],
+    "UGC NET": ["NET"],
+    "CSIR-NET": ["NET"],
+}
+
+
 def extract_qualifications(text):
+    """
+    Qualifications named in the resume, most specific first.
 
-    qualifications = []
+    Regex with word boundaries rather than substring search — see the note
+    on _QUALIFICATION_PATTERNS for why that matters.
+    """
 
-    keywords = [
-        "PhD",
-        "Ph.D",
-        "Ph. D",
-        "Doctor of Philosophy",
-        "UGC NET",
-        "NET",
-        "CSIR-NET",
-        "GATE",
-        "JRF",
+    lower_text = str(text or "").lower()
 
-        "MBA",
-        "PGDM",
-        "M.Tech",
-        "M.Ed",
-        "M.Sc",
-        "M.A",
-        "M.Com",
-        "MCA",
-        "MBM",
+    found = []
 
-        "B.Tech",
-        "B.Ed",
-        "B.Sc",
-        "B.A",
-        "B.Com",
-        "BCA",
-        "BBA",
+    for canonical, patterns in _QUALIFICATION_PATTERNS:
 
-        "D.El.Ed",
-        "D.T.Ed",
-        "DSM",
+        for pattern in patterns:
 
-        "CTET",
-        "TET"
-    ]
+            if re.search(pattern, lower_text):
+                found.append(canonical)
+                break
 
-    lower_text = text.lower()
+    # Drop the broader match when a more specific one is present.
+    for specific, broader in _QUALIFICATION_SUPERSEDES.items():
 
-    for keyword in keywords:
+        if specific in found:
 
-        if keyword.lower() in lower_text:
-            qualifications.append(keyword)
+            for term in broader:
 
-    return qualifications
+                if term in found:
+                    found.remove(term)
+
+    return found
+
 
 _QUALIFICATION_RANK = {
     "PhD": 100,
@@ -908,6 +946,9 @@ Resume:
                 max_tokens=2000,
                 response_format={"type": "json_object"}
             )
+
+            tracker.record(response)
+
             content = (
                 response.choices[0]
                 .message.content
