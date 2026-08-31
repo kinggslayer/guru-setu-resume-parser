@@ -32,6 +32,7 @@ from portal_export import to_portal_dataframe, drop_same_teacher
 from master_store import (
     extract_file_id,
     load_master,
+    SOURCE_FILE_ID,
     save_master,
     already_seen,
     to_master_rows,
@@ -268,10 +269,17 @@ def render_review_and_download(state_key, file_name, heading):
         key=f"download_{state_key}"
     )
 
+    scope = (
+        "just the candidates added in this run"
+        if state_key == "run_df"
+        else "every candidate ever extracted"
+    )
+
     st.caption(
-        "Upload it in the portal under Import / Export -> Import teachers. "
-        "Edits here change the downloaded file only — they are not written "
-        "back to the master database in Drive."
+        f"This file holds {scope}. Upload it in the portal under "
+        "Import / Export -> Import teachers. Edits here change the "
+        "downloaded file only — they are not written back to the master "
+        "database in Drive."
     )
 
 
@@ -504,8 +512,14 @@ def render_bottom_panels():
     render_duplicate_cleanup()
 
     render_review_and_download(
+        state_key="run_df",
+        file_name="guru_setu_teacher_import_this_run.xlsx",
+        heading="This run — review and download"
+    )
+
+    render_review_and_download(
         state_key="master_df",
-        file_name="guru_setu_teacher_import.xlsx",
+        file_name="guru_setu_teacher_import_all.xlsx",
         heading="Master database — review and download"
     )
 
@@ -958,12 +972,33 @@ if st.button("Process Resumes"):
                 "rather than Editor."
             )
 
+        # This run's rows on their own, for reviewing just what was added
+        # without scrolling a master that may hold thousands of rows.
+        #
+        # Taken from the MERGED frame rather than from new_rows, so a row
+        # dropped as a duplicate doesn't appear here as if it had been saved.
+        run_ids = {
+            str(value).strip()
+            for value in new_rows.get(SOURCE_FILE_ID, [])
+            if str(value).strip()
+        }
+
+        if run_ids and SOURCE_FILE_ID in master_df.columns:
+            st.session_state["run_df"] = master_df[
+                master_df[SOURCE_FILE_ID].astype(str).str.strip().isin(run_ids)
+            ].reset_index(drop=True)
+        else:
+            st.session_state.pop("run_df", None)
+
         st.session_state["master_df"] = master_df
         st.session_state.pop("master_df__edited", None)
+        st.session_state.pop("run_df__edited", None)
 
     else:
         st.session_state.pop("master_df", None)
         st.session_state.pop("master_df__edited", None)
+        st.session_state.pop("run_df", None)
+        st.session_state.pop("run_df__edited", None)
 
         if duplicate_content_count > 0:
             st.success(
