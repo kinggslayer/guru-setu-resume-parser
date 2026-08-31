@@ -789,7 +789,8 @@ Resume:
     extraction_failed = False
 
     max_attempts = 4
-    base_delay = 2 
+    base_delay = 2
+    last_error = None
 
     for attempt in range(max_attempts):
 
@@ -833,9 +834,13 @@ Resume:
 
         except Exception as e:
 
-            print(f"[OpenAI] Error on attempt: {type(e).__name__}: {e}")
+            print(
+                f"[OpenAI] Error on attempt: {type(e).__name__}: {e}",
+                flush=True
+            )
 
             err_str = str(e)
+            last_error = f"{type(e).__name__}: {err_str}"
 
             is_rate_limit = "429" in err_str or "rate_limit" in err_str.lower()
             is_parse_error = isinstance(e, json.JSONDecodeError)
@@ -964,5 +969,9 @@ Resume:
     )
 
     parsed["extraction_failed"] = extraction_failed
+
+    # Why it failed, so the app can show it instead of just "failed".
+    if extraction_failed and last_error:
+        parsed["extraction_error"] = last_error
 
     return parsed

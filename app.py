@@ -401,6 +401,23 @@ if st.button("Process Resumes"):
             r.get("resume_file_name", "unknown") for r in failed_extraction
         )
 
+        # The reason is nearly always identical for every file (bad key, no
+        # credit, model not enabled), so show the distinct reasons once
+        # rather than repeating the same line per resume.
+        reasons = sorted({
+            r["extraction_error"]
+            for r in failed_extraction
+            if r.get("extraction_error")
+        })
+
+        if reasons:
+            st.error(
+                "OpenAI rejected the request. Reason"
+                + ("s" if len(reasons) > 1 else "")
+                + ":\n\n"
+                + "\n\n".join(f"- {reason}" for reason in reasons)
+            )
+
         st.error(
             f"⚠️ {len(failed_extraction)} resumes could not be extracted "
             f"(errored after all retries — only email/phone were regex-extracted "
