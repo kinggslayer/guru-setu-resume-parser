@@ -433,30 +433,30 @@ def merge_into_master(master_df, new_df):
             # Blank keys must never match each other, or unrelated rows
             # with missing data would collapse into one.
             if file_id and file_id in seen_ids:
-                if origin == "new":
-                    report.append({
-                        "dropped": label(row),
-                        "reason": "same Drive file already recorded",
-                        "matched": seen_ids[file_id],
-                    })
+                report.append({
+                    "dropped": label(row),
+                    "reason": "same Drive file already recorded",
+                    "matched": seen_ids[file_id],
+                    "origin": origin,
+                })
                 continue
 
             if content and content in seen_hashes:
-                if origin == "new":
-                    report.append({
-                        "dropped": label(row),
-                        "reason": "identical text to another resume",
-                        "matched": seen_hashes[content],
-                    })
+                report.append({
+                    "dropped": label(row),
+                    "reason": "identical text to another resume",
+                    "matched": seen_hashes[content],
+                    "origin": origin,
+                })
                 continue
 
             if person and person in seen_people:
-                if origin == "new":
-                    report.append({
-                        "dropped": label(row),
-                        "reason": "same name and phone",
-                        "matched": seen_people[person],
-                    })
+                report.append({
+                    "dropped": label(row),
+                    "reason": "same name and phone",
+                    "matched": seen_people[person],
+                    "origin": origin,
+                })
                 continue
 
             if file_id:

@@ -896,6 +896,20 @@ if st.button("Process Resumes"):
 
         master_df, added, merge_report = merge_into_master(master_df, new_rows)
 
+        from_master = [
+            item for item in merge_report
+            if item.get("origin") == "master"
+        ]
+
+        if from_master:
+            st.warning(
+                f"{len(from_master)} duplicate row(s) that were already in "
+                "the master database have been cleaned up. This is why the "
+                "candidate count can go DOWN — those rows were duplicates of "
+                "each other, not new data being lost. It happens once; "
+                "later runs will show none."
+            )
+
         if merge_report:
             st.warning(
                 f"{len(merge_report)} row(s) were merged as duplicates. "
@@ -909,6 +923,11 @@ if st.button("Process Resumes"):
                         "Dropped": item["dropped"],
                         "Because": item["reason"],
                         "Same as": item["matched"],
+                        "From": (
+                            "already in master"
+                            if item.get("origin") == "master"
+                            else "this run"
+                        ),
                     }
                     for item in merge_report
                 ]),
