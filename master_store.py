@@ -148,6 +148,43 @@ TRACKING_COLUMNS = [
 MASTER_COLUMNS = PORTAL_COLUMNS + TRACKING_COLUMNS
 
 
+def drop_blank_rows(df):
+    """
+    Remove rows where every cell is empty. A row counts as real if it has
+    any identifying value at all — name, email or phone — so a partially
+    parsed candidate is still kept for review.
+    """
+
+    if df.empty:
+        return df
+
+    # Name, email or phone ONLY — deliberately NOT Source File ID.
+    #
+    # A row whose extraction failed still carries a file id, so counting
+    # that as content keeps rows with no usable data at all. The portal
+    # rejects those anyway (isImportRowUsable), so matching its rule here
+    # keeps the master and the portal in agreement.
+    identifying = [
+        column
+        for column in ("Full Name", "Email", "Phone")
+        if column in df.columns
+    ]
+
+    if not identifying:
+        return df
+
+    def has_content(row):
+        return any(
+            str(row.get(column, "")).strip()
+            and str(row.get(column, "")).strip().lower() != "nan"
+            for column in identifying
+        )
+
+    keep = [index for index, row in df.iterrows() if has_content(row)]
+
+    return df.loc[keep]
+
+
 def empty_master():
     """A master with the right shape but no rows."""
 
@@ -213,11 +250,19 @@ def load_master(folder_id, file_id=None):
 
     df = df.fillna("")
 
+    # Drop rows that are entirely blank.
+    #
+    # Clearing cell contents in Excel or Sheets (select + Delete) leaves the
+    # rows in place, so the workbook still reports its old length. Without
+    # this, emptying the master by hand appears to do nothing: the app keeps
+    # reporting the original count and keeps skipping files.
+    df = drop_blank_rows(df)
+
     # Keep any extra columns the user added by hand in Excel; they're
     # harmless and losing someone's manual notes would be worse.
     extra = [c for c in df.columns if c not in MASTER_COLUMNS]
 
-    return df[MASTER_COLUMNS + extra], True
+    return df[MASTER_COLUMNS + extra].reset_index(drop=True), True
 
 
 def save_master(folder_id, df, file_id=None):
@@ -345,6 +390,10 @@ def merge_into_master(master_df, new_df):
     # Person-level pass, last: file-level keys are more specific, so let
     # them decide first and only then collapse what remains by identity.
     combined = drop_same_teacher(combined)
+
+    # Never store a row the portal would reject. Cheap here, and it stops
+    # junk accumulating in the master across runs.
+    combined = drop_blank_rows(combined).reset_index(drop=True)
 
     added = len(combined) - len(master_df)
 

@@ -343,11 +343,32 @@ def render_duplicate_cleanup():
             )
 
         if failures:
-            st.error(
-                "Could not trash some files (the folder may be shared as "
-                "Viewer rather than Editor):\n\n"
-                + "\n\n".join(f"- {f}" for f in failures)
+
+            permission_denied = any(
+                "insufficientFilePermissions" in f or "403" in f
+                for f in failures
             )
+
+            if permission_denied:
+                st.error(
+                    "Google refused to trash these files — the service "
+                    "account isn't allowed to modify them.\n\n"
+                    "Two possible causes:\n\n"
+                    "1. The folder is shared with the service account as "
+                    "**Viewer**. Change it to **Editor**.\n\n"
+                    "2. Someone else **owns** the files. On Drive only the "
+                    "owner can trash a file — Editor access is not enough. "
+                    "If these CVs were shared into your Drive by another "
+                    "account, delete the copies from that account, or make "
+                    "your own copies (select all -> Make a copy) so you own "
+                    "them, and point the app at the folder holding those."
+                )
+
+            else:
+                st.error(
+                    "Could not trash some files:\n\n"
+                    + "\n\n".join(f"- {f}" for f in failures)
+                )
 
         st.session_state.pop("dup_groups", None)
 
@@ -488,9 +509,15 @@ if st.button("Process Resumes"):
     seen_file_ids, seen_hashes = already_seen(master_df)
 
     if master_existed:
+        source = (
+            f"file `{master_file_id}`"
+            if master_file_id
+            else f"`{MASTER_FILE_NAME}` in the resumes folder"
+        )
+
         st.info(
             f"Master database has {len(master_df)} candidates from previous "
-            f"runs. Files already in it will be skipped."
+            f"runs, read from {source}. Files already in it will be skipped."
         )
     else:
         st.info(
