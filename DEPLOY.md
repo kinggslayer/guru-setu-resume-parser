@@ -55,8 +55,11 @@ accounts of whoever should have access.
 ### 5. Share the Drive folder
 
 The service account has its own email (`client_email` in the JSON). Share
-your resume Drive folder and the `Resume_Master_DB` sheet with that address,
-or the app authenticates fine and then sees nothing.
+your resume folder with that address as **Viewer**, or the app authenticates
+fine and then reports zero files.
+
+That is the only Google setup needed. The app reads the folder and writes
+nothing back — no spreadsheet to create or share.
 
 ### Living with the free tier
 

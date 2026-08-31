@@ -1,10 +1,3 @@
-from sheets_utils import (
-    append_candidate,
-    get_existing_hashes,
-    get_existing_contacts,
-    ensure_headers,
-    get_sheet
-)
 import streamlit as st
 import os
 import io
@@ -196,9 +189,7 @@ def render_review_and_download(state_key, file_name, heading):
     )
 
     st.caption(
-        "Upload it in the portal under Import / Export -> Import teachers. "
-        "Note: edits made here are NOT written back to the master sheet, so "
-        "the next run still de-duplicates against the original values."
+        "Upload it in the portal under Import / Export -> Import teachers."
     )
 
 
@@ -273,31 +264,11 @@ if st.button("Process Resumes"):
 
     st.write(f"Found {len(files)} files")
 
-    try:
-        added_headers = ensure_headers()
-
-        if added_headers:
-            st.success(
-                "Added new columns to the master sheet: "
-                + ", ".join(added_headers)
-            )
-
-    except Exception as e:
-        st.error(
-            f"Master sheet headers need attention: {e} "
-            "Processing stopped — fix row 1 first, or new fields will be "
-            "written under blank headers and lost."
-        )
-        st.stop()
-
-    existing_hashes = get_existing_hashes()
-    existing_emails, existing_phones = get_existing_contacts()
-
-    st.info(
-        f"{len(existing_hashes)} resumes already in the master sheet by content — "
-        f"{len(files)} files in this folder will be checked against them now "
-        f"(downloads happen regardless; duplicates are skipped before any OpenAI call)."
-    )
+    # Duplicate tracking is per-run only. Two copies of the same CV in the
+    # folder are parsed once; nothing is remembered between runs.
+    existing_hashes = set()
+    existing_emails = set()
+    existing_phones = set()
 
     download_progress = st.progress(0)
     process_progress = st.progress(0)
@@ -375,9 +346,7 @@ if st.button("Process Resumes"):
                         results.append(result)
                         continue
 
-                    time.sleep(1)
-                    append_candidate(result)
-                    result["written_to_sheet"] = True
+                    result["keep"] = True
 
                     if result.get("content_hash"):
                         existing_hashes.add(str(result["content_hash"]))
@@ -399,15 +368,15 @@ if st.button("Process Resumes"):
 
     unique_results = [
         r for r in results
-        if r.get("written_to_sheet")
+        if r.get("keep")
     ]
 
     st.write(
         f"Done. {len(results)} files processed "
         f"({duplicate_content_count} duplicate content, "
-        f"{skipped_existing_count} matched an existing candidate, "
-        f"{len(failed_extraction)} failed extraction and were NOT written to the sheet). "
-        f"{len(unique_results)} new candidates actually added to the sheet this run."
+        f"{skipped_existing_count} same person as another file, "
+        f"{len(failed_extraction)} failed extraction). "
+        f"{len(unique_results)} candidates in the sheet below."
     )
 
     needs_ocr = [r for r in results if r.get("needs_ocr")]
@@ -472,55 +441,3 @@ render_review_and_download(
     file_name="guru_setu_teacher_import.xlsx",
     heading="Review and edit before uploading"
 )
-
-
-# =============================================================================
-#  Export the whole master sheet in portal format
-#  Useful for a first-time bulk load, or to re-import everything after the
-#  mapping changes. Independent of the run above — reads the Google Sheet.
-# =============================================================================
-
-st.divider()
-
-with st.expander("Export the entire master sheet for the portal"):
-
-    st.caption(
-        "Converts every candidate already in Resume_Master_DB into the "
-        "portal's teacher import format. The portal skips duplicates on "
-        "import, so re-uploading an overlapping file is safe."
-    )
-
-    if st.button("Build portal file from master sheet"):
-
-        try:
-            sheet = get_sheet()
-            records = sheet.get_all_records()
-
-        except Exception as e:
-            st.error(f"Could not read the master sheet: {e}")
-            records = None
-
-        if records is not None:
-
-            if not records:
-                st.warning("The master sheet is empty.")
-
-            else:
-
-                full_df = to_portal_dataframe(records)
-                full_df = drop_same_teacher(full_df)
-
-                st.session_state["master_df"] = add_review_column(full_df)
-
-                st.success(
-                    f"{len(full_df)} teachers ready "
-                    f"(from {len(records)} sheet rows)."
-                )
-
-    # Inside the expander but OUTSIDE the button block, for the same reason
-    # as the run grid above: the button's body only runs once.
-    render_review_and_download(
-        state_key="master_df",
-        file_name="guru_setu_teacher_import_all.xlsx",
-        heading="Review and edit the full master export"
-    )
