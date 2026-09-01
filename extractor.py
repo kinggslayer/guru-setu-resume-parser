@@ -1,8 +1,17 @@
 import json
+import logging
 import re
 import time
 import random
 import pdfplumber
+
+# pdfminer logs a warning for every malformed font it meets. A folder of a
+# few thousand CVs produces tens of thousands of identical lines, which
+# buries real errors in the Streamlit log and slows the run down. The
+# warnings are cosmetic — text still extracts — so they are silenced.
+for _noisy in ("pdfminer", "pdfminer.pdffont", "pdfminer.pdfinterp",
+               "pdfminer.pdfpage", "pdfminer.converter", "pdfplumber"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 from docx import Document
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -54,14 +63,28 @@ def sanitize_age(value):
     if value is None:
         return None
 
+    text = str(value).strip()
+
     try:
-        age_int = int(float(str(value).strip()))
+        age_int = int(float(text))
 
         if 15 <= age_int <= 80:
             return age_int
 
     except (ValueError, TypeError):
         pass
+
+    # "34 years", "Age: 34", "34 yrs" — a plain int() fails on all of these
+    # and the age was silently lost. Take the first plausible number, but
+    # only when the text is short: a sentence could contain any number.
+    if len(text) <= 30:
+
+        for match in re.findall(r"\d{1,3}", text):
+
+            candidate = int(match)
+
+            if 15 <= candidate <= 80:
+                return candidate
 
     return None
 
@@ -127,18 +150,56 @@ def sanitize_salary_unit(value, amount=None):
     return "lpa" if float(amount) < 1000 else "pm"
 
 
+def reconcile_salary(amount, unit):
+    """
+    Make the amount agree with its unit, and return (amount, unit).
+
+    The portal reads 'lpa' as a figure IN LAKHS, so 450000 with unit 'lpa'
+    means 450000 lakh — about 45 billion rupees. The model is asked to
+    convert, but it returns the raw annual figure often enough that this
+    has to be enforced here rather than trusted.
+
+    The reverse is also caught: 4.5 marked 'pm' is not a monthly salary in
+    rupees, it is lakhs per annum.
+    """
+
+    if amount is None:
+        return None, None
+
+    value = float(amount)
+
+    if unit == "lpa" and value >= 1000:
+        # An annual rupee figure, not lakhs. 450000 -> 4.5
+        value = round(value / 100000, 2)
+
+    elif unit == "pm" and value < 1000:
+        # Too small to be a monthly wage; it is lakhs per annum.
+        return (int(value) if value == int(value) else round(value, 2)), "lpa"
+
+    if value <= 0:
+        return None, None
+
+    return (int(value) if value == int(value) else round(value, 2)), unit
+
+
 def sanitize_college_type(value):
-    """Only 'IIT', 'NIT', or None are valid — guard against model drift."""
+    """
+    Only 'IIT', 'NIT', or None are valid — guard against model drift.
+
+    Matched on word boundaries, because a substring test classified "IIIT
+    Hyderabad" as an IIT and "MANIT" or "SNIT" as an NIT. Those are
+    different institutions, and the portal filters on this field.
+    """
 
     if not value:
         return None
 
     value_upper = str(value).strip().upper()
 
-    if "IIT" in value_upper:
+    if re.search(r"\bIIT\b", value_upper):
         return "IIT"
 
-    if "NIT" in value_upper:
+    if re.search(r"\bNIT\b", value_upper):
         return "NIT"
 
     return None
@@ -155,7 +216,32 @@ def sanitize_phone(value):
     if not value:
         return None
 
-    digits = re.sub(r"\D", "", str(value))
+    text = str(value)
+
+    digits = re.sub(r"\D", "", text)
+
+    normalised = _as_indian_mobile(digits)
+
+    if normalised:
+        return normalised
+
+    # Resumes often list two numbers: "9812345678 / 9876543210" or
+    # "+91-98123 45678, 98765 43210". Stripping all non-digits then glues
+    # them into one 20-digit string that matches nothing, and the candidate
+    # ends up with NO phone at all. Fall back to scanning for the first
+    # number that stands on its own.
+    for candidate in re.findall(r"\d[\d\s\-().]{7,}\d", text):
+
+        normalised = _as_indian_mobile(re.sub(r"\D", "", candidate))
+
+        if normalised:
+            return normalised
+
+    return None
+
+
+def _as_indian_mobile(digits):
+    """digits -> +91XXXXXXXXXX, or None if it isn't a valid mobile."""
 
     if len(digits) == 12 and digits.startswith("91"):
         digits = digits[2:]
@@ -178,7 +264,11 @@ def flatten_value(item):
     """
 
     if isinstance(item, str):
-        return item.strip()
+        text = item.strip()
+
+        # The literal words too: earlier versions wrote str(None) into
+        # these fields, so "None" and "nan" appear in real stored data.
+        return text if text.lower() not in ("none", "nan", "null") else None
 
     if isinstance(item, dict):
         parts = [
@@ -193,7 +283,18 @@ def flatten_value(item):
         flattened = [x for x in flattened if x]
         return " / ".join(flattened) if flattened else None
 
-    return str(item)
+    # None must come back as None, not the string "None".
+    #
+    # str(None) is "None", which is truthy, so it survived every downstream
+    # emptiness check and was written into education_history, college and
+    # previous_institutions as if it were real data. The same mistake
+    # elsewhere merged unrelated candidates and crashed a whole run.
+    if item is None:
+        return None
+
+    text = str(item).strip()
+
+    return text if text.lower() not in ("none", "nan", "null") else None
 
 
 def flatten_list_field(value):
@@ -206,17 +307,35 @@ def flatten_list_field(value):
     return [item for item in result if item]
 
 
-def read_pdf(file, char_limit=8000):
+# A resume is a handful of pages. Reading beyond this is wasted work on a
+# mis-filed document, and the memory it costs is what kills a large run.
+MAX_PDF_PAGES = 12
+
+
+def read_pdf(file, char_limit=8000, max_pages=MAX_PDF_PAGES):
     text = ""
 
     with pdfplumber.open(file) as pdf:
 
-        for page in pdf.pages:
+        for index, page in enumerate(pdf.pages):
+
+            if index >= max_pages:
+                break
 
             page_text = page.extract_text()
 
             if page_text:
                 text += page_text + "\n"
+
+            # pdfplumber keeps each page's parsed layout in memory for the
+            # lifetime of the document. Across thousands of CVs on a 1 GB
+            # container that accumulation is fatal, so release it per page.
+            try:
+                page.flush_cache()
+                page.get_textmap.cache_clear()
+
+            except Exception:
+                pass
 
             if len(text) >= char_limit:
                 break
@@ -1127,15 +1246,15 @@ Resume:
     parsed["preferred_job_type"] = snap_job_type(parsed.get("preferred_job_type"))
     parsed["availability"] = snap_availability(parsed.get("availability"))
 
-    parsed["current_salary"] = sanitize_salary(parsed.get("current_salary"))
-    parsed["current_salary_unit"] = sanitize_salary_unit(
-        parsed.get("current_salary_unit"), parsed["current_salary"]
-    )
+    for field in ("current_salary", "expected_salary"):
 
-    parsed["expected_salary"] = sanitize_salary(parsed.get("expected_salary"))
-    parsed["expected_salary_unit"] = sanitize_salary_unit(
-        parsed.get("expected_salary_unit"), parsed["expected_salary"]
-    )
+        amount = sanitize_salary(parsed.get(field))
+        unit = sanitize_salary_unit(parsed.get(f"{field}_unit"), amount)
+
+        amount, unit = reconcile_salary(amount, unit)
+
+        parsed[field] = amount
+        parsed[f"{field}_unit"] = unit
 
     parsed["extraction_failed"] = extraction_failed
 

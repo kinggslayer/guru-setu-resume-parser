@@ -31,11 +31,7 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from portal_export import (
-    PORTAL_COLUMNS,
-    to_portal_dataframe,
-    drop_same_teacher,
-)
+from portal_export import PORTAL_COLUMNS, to_portal_dataframe
 from drive_utils import (
     download_bytes_from_drive,
     upload_bytes_to_drive,
@@ -281,13 +277,25 @@ def load_master(folder_id, file_id=None):
     # rows in place, so the workbook still reports its old length. Without
     # this, emptying the master by hand appears to do nothing: the app keeps
     # reporting the original count and keeps skipping files.
+    rows_in_file = len(df)
+
     df = drop_blank_rows(df)
+
+    # How many rows the workbook holds vs how many are usable. Reported by
+    # the caller: a count that silently shrinks between the file and the
+    # app looks like data loss, and has been mistaken for it before.
+    dropped_blank = rows_in_file - len(df)
 
     # Keep any extra columns the user added by hand in Excel; they're
     # harmless and losing someone's manual notes would be worse.
     extra = [c for c in df.columns if c not in MASTER_COLUMNS]
 
-    return df[MASTER_COLUMNS + extra].reset_index(drop=True), True
+    cleaned = df[MASTER_COLUMNS + extra].reset_index(drop=True)
+
+    cleaned.attrs["rows_in_file"] = rows_in_file
+    cleaned.attrs["dropped_blank"] = dropped_blank
+
+    return cleaned, True
 
 
 def save_master(folder_id, df, file_id=None):
@@ -343,16 +351,35 @@ def to_master_rows(records):
         return empty_master()
 
     # to_portal_dataframe drops unusable rows, so line the tracking data up
-    # by position on the records that actually survived rather than
-    # assuming the two lists still match index for index.
+    # by position on the records that actually survived.
+    #
+    # The test MUST match to_portal_dataframe's exactly. It normalises via
+    # _text(), which treats the literal strings "None" and "nan" as blank —
+    # so a record with full_name="None" is dropped there but was kept here,
+    # the two lists ended up different lengths, and assigning the tracking
+    # columns raised "Length of values does not match length of index",
+    # killing the whole run. Earlier versions wrote that exact text, so
+    # these records genuinely exist.
+    def usable_value(value):
+        text = "" if value is None else str(value).strip()
+        return "" if text.lower() in ("none", "nan", "null") else text
+
     usable = [
         r for r in records
         if any([
-            str(r.get("full_name") or "").strip(),
-            str(r.get("email") or "").strip(),
-            str(r.get("phone") or "").strip(),
+            usable_value(r.get("full_name")),
+            usable_value(r.get("email")),
+            usable_value(r.get("phone")),
         ])
     ]
+
+    if len(usable) != len(portal_df):
+        # Never silently mis-assign tracking data to the wrong candidate.
+        raise ValueError(
+            f"Row alignment mismatch: {len(usable)} usable records but "
+            f"{len(portal_df)} portal rows. This would attach each file id "
+            "to the wrong candidate."
+        )
 
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
@@ -482,7 +509,7 @@ def merge_into_master(master_df, new_df):
     return combined, added, report
 
 
-def apply_edits(master_df, edited_df):
+def apply_edits(master_df, edited_df, visible_df=None):
     """
     Write reviewed values from the grid back onto the master.
 
@@ -493,13 +520,24 @@ def apply_edits(master_df, edited_df):
     Only the portal columns are copied across; tracking columns are left
     alone so dedup keeps working. Rows added by hand in the grid have no
     file id and are appended as new.
+
+    visible_df is what the editor was given BEFORE the user touched it.
+    Deletions are worked out by diffing it against edited_df, and only
+    rows that were actually on screen can be deleted.
+
+    That distinction is essential: the run panel shows a subset of the
+    master, and so does any search or filter. Diffing against the whole
+    master instead would treat every row the user simply wasn't looking at
+    as deleted, and wipe the database.
+
+    Returns (updated, changed, appended, deleted).
     """
 
     if edited_df is None or edited_df.empty:
-        return master_df, 0, 0
+        return master_df, 0, 0, 0
 
     if SOURCE_FILE_ID not in master_df.columns:
-        return master_df, 0, 0
+        return master_df, 0, 0, 0
 
     editable = [c for c in PORTAL_COLUMNS if c in edited_df.columns]
 
@@ -547,13 +585,45 @@ def apply_edits(master_df, edited_df):
         if row_changed:
             changed_rows += 1
 
+    # Work out deletions against what was on screen, never the whole master.
+    deleted_ids = set()
+
+    if visible_df is not None and SOURCE_FILE_ID in visible_df.columns:
+
+        was_visible = {
+            cell(row, SOURCE_FILE_ID)
+            for _, row in visible_df.iterrows()
+            if cell(row, SOURCE_FILE_ID)
+        }
+
+        still_present = {
+            cell(row, SOURCE_FILE_ID)
+            for _, row in edited_df.iterrows()
+            if cell(row, SOURCE_FILE_ID)
+        }
+
+        deleted_ids = was_visible - still_present
+
+    if deleted_ids:
+        keep_mask = [
+            cell(row, SOURCE_FILE_ID) not in deleted_ids
+            for _, row in updated.iterrows()
+        ]
+
+        updated = updated[pd.Series(keep_mask, index=updated.index)]
+
     if appended:
         updated = pd.concat(
             [updated, pd.DataFrame(appended)],
             ignore_index=True
         )
 
-    return updated, changed_rows, len(appended)
+    return (
+        updated.reset_index(drop=True),
+        changed_rows,
+        len(appended),
+        len(deleted_ids),
+    )
 
 
 def strip_tracking(df, keep_id=False):

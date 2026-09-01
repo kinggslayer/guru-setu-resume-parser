@@ -113,7 +113,7 @@ def main():
 
     print()
     print("=" * 68)
-    print(f"  Share your Drive folder and the Resume_Master_DB sheet with:")
+    print("  Share your Drive folder with:")
     print(f"    {data.get('client_email', '(client_email missing)')}")
     print("  Otherwise the app signs in fine but sees no files.")
     print("=" * 68)

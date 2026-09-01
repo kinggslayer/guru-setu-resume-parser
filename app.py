@@ -2,7 +2,6 @@ import streamlit as st
 import os
 import io
 import shutil
-import time
 import hashlib
 
 import pandas as pd
@@ -19,6 +18,8 @@ from drive_utils import (
 
 from duplicates import find_duplicate_groups, summarise
 
+from skiplist import load_failed, save_failed, reason_for
+
 from usage import tracker
 
 from extractor import (
@@ -29,15 +30,12 @@ from extractor import (
     MIN_USABLE_CHARS
 )
 
-from portal_export import to_portal_dataframe, drop_same_teacher
-
 from master_store import (
     extract_file_id,
     load_master,
     save_master,
     apply_edits,
     SOURCE_FILE_ID,
-    save_master,
     already_seen,
     to_master_rows,
     merge_into_master,
@@ -110,6 +108,16 @@ include_subfolders = st.checkbox(
     "Include sub-folders",
     value=True,
     help="Walks folders inside the one you paste."
+)
+
+retry_failed = st.checkbox(
+    "Retry files that failed before",
+    value=False,
+    help=(
+        "Files that produced nothing usable are remembered and skipped, so "
+        "you aren't charged to parse the same broken PDF every run. Tick "
+        "this to try them again."
+    )
 )
 
 uploaded_files = st.file_uploader(
@@ -244,7 +252,19 @@ def render_review_and_download(state_key, file_name, heading):
 
     df = st.session_state.get(state_key)
 
-    if df is None or df.empty:
+    if df is None:
+        return
+
+    if df.empty:
+
+        # Silence here reads as a crash. Say why there's nothing.
+        if state_key == "master_df":
+            st.subheader(heading)
+            st.info(
+                "The master database is empty. Once a run produces "
+                "candidates they will appear here with a download button."
+            )
+
         return
 
     # Hide the tracking columns: they're for dedup, not for editing, and
@@ -319,8 +339,15 @@ def render_review_and_download(state_key, file_name, heading):
     # the dedup data.
     edit_key = f"{state_key}__edited"
 
+    # What the editor is being given, before any user change. Deletions are
+    # diffed against this — never against the whole master, which would
+    # treat filtered-out rows as deleted.
+    visible_df = st.session_state.get(edit_key, df)
+
+    st.session_state[f"{edit_key}__visible"] = visible_df
+
     edited = st.data_editor(
-        st.session_state.get(edit_key, df),
+        visible_df,
         width="stretch",
         num_rows="dynamic",
         hide_index=True,
@@ -394,12 +421,15 @@ def render_review_and_download(state_key, file_name, heading):
             return
 
         try:
-            updated, changed, appended = apply_edits(
+            updated, changed, appended, deleted = apply_edits(
                 st.session_state.get("master_df"),
-                strip_review_column(edited)
+                strip_review_column(edited),
+                strip_review_column(
+                    st.session_state.get(f"{edit_key}__visible", edited)
+                )
             )
 
-            if not changed and not appended:
+            if not changed and not appended and not deleted:
                 st.info("No changes to save.")
 
             else:
@@ -413,6 +443,8 @@ def render_review_and_download(state_key, file_name, heading):
                     parts.append(f"{changed} row(s) updated")
                 if appended:
                     parts.append(f"{appended} row(s) added")
+                if deleted:
+                    parts.append(f"{deleted} row(s) removed")
 
                 st.success(
                     ", ".join(parts).capitalize()
@@ -472,14 +504,31 @@ def render_duplicate_cleanup():
     if not groups:
         return
 
-    duplicate_count, group_count = summarise(groups)
+    total_scanned = st.session_state.get("dup_total_files")
+
+    duplicate_count, group_count, involved, appear_once = summarise(
+        groups, total_scanned
+    )
 
     st.subheader("Duplicate files in this folder")
 
+    message = (
+        f"{group_count} set(s) of identical files, holding {involved} files "
+        f"between them — {group_count} to keep and {duplicate_count} extra "
+        "copies to remove."
+    )
+
+    if appear_once is not None:
+        message += (
+            f" The other {appear_once} file(s) in the folder have no copy "
+            f"and are untouched ({involved} + {appear_once} = "
+            f"{total_scanned})."
+        )
+
     st.write(
-        f"{duplicate_count} duplicate file(s) across {group_count} set(s). "
-        "These are byte-identical copies, matched on Drive's own checksum — "
-        "nothing was downloaded to find them."
+        message
+        + " Matched on Drive's own checksum, so nothing was downloaded to "
+        "find them."
     )
 
     all_duplicates = [
@@ -940,8 +989,13 @@ if st.button("Process Resumes"):
             f"(not downloadable as-is): {skipped_names}"
         )
 
+    count_listed = len(files) + len(skipped_files)
+    count_native = len(skipped_files)
+
     # The master workbook lives in this folder; it is not a resume.
+    before_master_filter = len(files)
     files = [f for f in files if f["name"] != MASTER_FILE_NAME]
+    count_master_file = before_master_filter - len(files)
 
     if not files:
         st.error("No downloadable files found.")
@@ -982,10 +1036,21 @@ if st.button("Process Resumes"):
             else f"`{MASTER_FILE_NAME}` in the resumes folder"
         )
 
+        rows_in_file = master_df.attrs.get("rows_in_file", len(master_df))
+        dropped_blank = master_df.attrs.get("dropped_blank", 0)
+
         st.info(
             f"Master database has {len(master_df)} candidates from previous "
             f"runs, read from {source}. Files already in it will be skipped."
         )
+
+        if dropped_blank:
+            st.caption(
+                f"The workbook holds {rows_in_file} rows; {dropped_blank} of "
+                "them have no name, email or phone, so they are ignored here "
+                "and excluded from the download. The portal would reject "
+                "them too. Delete them in the workbook to tidy it up."
+            )
     else:
         st.info(
             f"No master database yet — one will be created in this folder "
@@ -994,17 +1059,25 @@ if st.button("Process Resumes"):
 
     # Byte-identical copies, found from Drive's own checksums — free, and
     # done before parsing so the duplicate never costs a download or a call.
+    count_duplicate_files = 0
+
     dup_groups = find_duplicate_groups(files, seen_file_ids)
 
     st.session_state["dup_groups"] = dup_groups
 
+    st.session_state["dup_total_files"] = len(files)
+
     if dup_groups:
-        duplicate_count, group_count = summarise(dup_groups)
+        duplicate_count, group_count, involved, appear_once = summarise(
+            dup_groups, len(files)
+        )
 
         st.warning(
-            f"{duplicate_count} duplicate file(s) in this folder across "
-            f"{group_count} set(s) — identical copies under different names. "
-            "They are skipped below, and you can trash them at the bottom "
+            f"{duplicate_count} extra copies to skip: {group_count} set(s) of "
+            f"identical files account for {involved} of the {len(files)} "
+            f"files here, so one copy from each set is parsed and "
+            f"{duplicate_count} are skipped. The remaining {appear_once} "
+            "file(s) have no copy. You can trash the extras at the bottom "
             "of the page."
         )
 
@@ -1013,11 +1086,34 @@ if st.button("Process Resumes"):
             d["id"] for g in dup_groups for d in g["duplicates"]
         }
 
+        before = len(files)
         files = [f for f in files if f["id"] not in duplicate_ids]
+        count_duplicate_files = before - len(files)
 
     # Skip already-known files up front: no download, no OpenAI call.
     known_files = [f for f in files if f["id"] in seen_file_ids]
     files = [f for f in files if f["id"] not in seen_file_ids]
+    count_already_in_master = len(known_files)
+
+    # Files that produced nothing usable last time. Retrying them costs a
+    # paid call — OCR included — for a result that will almost certainly be
+    # the same, so they are skipped unless explicitly asked for.
+    previously_failed = load_failed(folder_id)
+
+    count_previously_failed = 0
+
+    if previously_failed and not retry_failed:
+
+        before = len(files)
+        files = [f for f in files if f["id"] not in previously_failed]
+        count_previously_failed = before - len(files)
+
+        if count_previously_failed:
+            st.write(
+                f"Skipping {count_previously_failed} file(s) that produced "
+                "nothing usable before. Tick 'Retry files that failed "
+                "before' to try them again."
+            )
 
     if known_files:
         st.write(
@@ -1057,7 +1153,10 @@ if st.button("Process Resumes"):
     #  Batching also means the master is saved as the run progresses, so a
     #  crash at file 900 keeps the first 880 rather than losing everything.
     # ------------------------------------------------------------------
-    batch_size = max(int(get_secret("BATCH_SIZE", 40) or 40), 1)
+    # Smaller batches mean a lower memory peak and less work lost if the
+    # container is killed: whatever a batch produced is saved before the
+    # next starts, so a crash costs at most one batch of OpenAI calls.
+    batch_size = max(int(get_secret("BATCH_SIZE", 25) or 25), 1)
 
     overall_progress = st.progress(0.0)
     status = st.empty()
@@ -1168,11 +1267,20 @@ if st.button("Process Resumes"):
         groq_executor.shutdown(wait=True)
 
         # Save what this batch produced before starting the next one.
-        batch_keepers = [
-            r for r in results[saved_total:] if r.get("keep")
-        ]
+        batch_results = results[saved_total:]
+
+        batch_keepers = [r for r in batch_results if r.get("keep")]
 
         saved_total = len(results)
+
+        # Remember what produced nothing, so the next run doesn't pay to
+        # parse it again.
+        for record in batch_results:
+
+            reason = reason_for(record)
+
+            if reason and record.get("file_id"):
+                previously_failed[str(record["file_id"])] = reason
 
         if batch_keepers:
 
@@ -1183,6 +1291,11 @@ if st.button("Process Resumes"):
 
                 save_master(folder_id, master_df, master_file_id)
 
+                status.write(
+                    f"Saved: {len(master_df)} candidates in the master. "
+                    f"{processed_count} of {total} files done."
+                )
+
             except Exception as e:
                 st.error(
                     f"Could not save after this batch: {e} "
@@ -1190,7 +1303,18 @@ if st.button("Process Resumes"):
                     "batches may be lost too."
                 )
 
+    if previously_failed:
+        save_failed(folder_id, previously_failed)
+
     status.write(f"Processed {processed_count} of {total} files.")
+
+    if processed_count < total:
+        st.warning(
+            f"Only {processed_count} of {total} files were processed. "
+            "Everything completed is already saved to the master database — "
+            "run the same folder again and it will carry on from here, "
+            "skipping what's done. You are not charged twice for those."
+        )
 
     duplicate_content_count = sum(1 for r in results if r.get("duplicate_of_content"))
     skipped_existing_count = sum(1 for r in results if r.get("skipped_existing_contact"))
@@ -1218,6 +1342,78 @@ if st.button("Process Resumes"):
             "read by transcribing the page images. Check those rows in the "
             "grid — transcription is less reliable than real text."
         )
+
+    # ------------------------------------------------------------------
+    #  Full reconciliation.
+    #
+    #  Every file the folder contains, accounted for. Scattered counts in
+    #  separate messages make it impossible to tell whether files went
+    #  missing or were legitimately skipped — this has to add up exactly.
+    # ------------------------------------------------------------------
+    parsed_count = len(results)
+
+    ocr_count = sum(1 for r in results if r.get("needs_ocr"))
+    failed_count = sum(
+        1 for r in results
+        if r.get("extraction_failed") and not r.get("needs_ocr")
+    )
+    same_content = sum(1 for r in results if r.get("duplicate_of_content"))
+    same_person = sum(1 for r in results if r.get("skipped_existing_contact"))
+    kept_count = sum(1 for r in results if r.get("keep"))
+
+    upload_count = len(uploaded_files or [])
+
+    accounting = [
+        ("Files listed in the folder(s)", count_listed),
+        ("  minus Google Docs/Sheets/Slides (not resumes)", -count_native),
+        ("  minus the master database file", -count_master_file),
+        ("  minus byte-identical duplicate copies", -count_duplicate_files),
+        ("  minus already in the master database", -count_already_in_master),
+        ("  minus failed on a previous run", -count_previously_failed),
+        ("  minus downloads that failed", -len(download_failures)),
+        ("  plus files you uploaded directly", upload_count),
+        ("= Files parsed", parsed_count),
+        ("  minus scans with no readable text", -ocr_count),
+        ("  minus extraction errors", -failed_count),
+        ("  minus identical text to another resume", -same_content),
+        ("  minus same person as another file this run", -same_person),
+        ("= New candidates from this run", kept_count),
+    ]
+
+    with st.expander("Where every file went", expanded=True):
+
+        st.dataframe(
+            pd.DataFrame(
+                [{"Stage": label, "Files": value} for label, value in accounting]
+            ),
+            width="stretch",
+            hide_index=True
+        )
+
+        # The two subtotals must land exactly; if they don't, a file was
+        # lost somewhere and that is worth shouting about.
+        expected_parsed = (
+            count_listed - count_native - count_master_file
+            - count_duplicate_files - count_already_in_master
+            - count_previously_failed
+            - len(download_failures) + upload_count
+        )
+
+        expected_new = (
+            parsed_count - ocr_count - failed_count
+            - same_content - same_person
+        )
+
+        if expected_parsed != parsed_count or expected_new != kept_count:
+            st.error(
+                f"These numbers don't reconcile: expected {expected_parsed} "
+                f"parsed but got {parsed_count}; expected {expected_new} new "
+                f"but got {kept_count}. Some files are unaccounted for — "
+                "send me this table."
+            )
+
+        else:
+            st.caption("Every file is accounted for; the totals reconcile.")
 
     cost_line = tracker.summary()
 
@@ -1378,7 +1574,11 @@ if st.button("Process Resumes"):
         st.session_state.pop("run_df__edited", None)
 
     else:
-        st.session_state.pop("master_df", None)
+        # No NEW candidates this run — but the master still exists and the
+        # user still needs to see and download it. Clearing it here hid the
+        # whole database, download included, which looks like the app
+        # produced nothing at all.
+        st.session_state["master_df"] = master_df
         st.session_state.pop("master_df__edited", None)
         st.session_state.pop("run_df", None)
         st.session_state.pop("run_df__edited", None)

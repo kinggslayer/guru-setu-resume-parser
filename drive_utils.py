@@ -59,14 +59,35 @@ def get_drive_service():
 
 
 def extract_folder_id(folder_url):
+    """
+    The folder id from a Drive URL.
 
-    if "/folders/" in folder_url:
-        return folder_url.split("/folders/")[1].split("?")[0]
+    Trailing slashes, query strings and any path after the id are stripped.
+    A URL copied with a trailing slash previously yielded "1ABC/", which
+    Drive rejects — and the run reported an empty folder rather than a bad
+    link, which is a confusing way to fail.
+    """
+
+    text = str(folder_url or "").strip()
+
+    if "/folders/" in text:
+
+        tail = text.split("/folders/")[1]
+
+        # Cut at the first query string, fragment or further path segment.
+        for separator in ("?", "#", "/"):
+            tail = tail.split(separator)[0]
+
+        folder_id = tail.strip()
+
+        if folder_id:
+            return folder_id
 
     raise ValueError("Invalid Google Drive folder link")
 
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 
 
 def get_files_from_folder(folder_url, service=None, recursive=True):
@@ -109,6 +130,11 @@ def get_files_from_folder(folder_url, service=None, recursive=True):
 
             all_files.append(item)
 
+    # A shortcut is a pointer, not a file. Its own mimeType is a Google
+    # native type, so without this it would be silently skipped — and a
+    # folder full of shortcuts to CVs would look empty.
+    all_files = _resolve_shortcuts(service, all_files)
+
     downloadable = [
         f for f in all_files
         if not f.get("mimeType", "").startswith(GOOGLE_NATIVE_MIME_PREFIX)
@@ -120,6 +146,47 @@ def get_files_from_folder(folder_url, service=None, recursive=True):
     ]
 
     return downloadable, skipped
+
+
+def _resolve_shortcuts(service, files):
+    """
+    Replace each shortcut with the file it points at.
+
+    The target's own metadata is fetched, because the shortcut carries no
+    checksum or owner of its own — and both are needed for duplicate
+    detection and deletion.
+    """
+
+    resolved = []
+
+    for item in files:
+
+        if item.get("mimeType") != SHORTCUT_MIME:
+            resolved.append(item)
+            continue
+
+        target_id = (item.get("shortcutDetails") or {}).get("targetId")
+
+        if not target_id:
+            continue
+
+        try:
+            target = service.files().get(
+                fileId=target_id,
+                fields=(
+                    "id,name,mimeType,md5Checksum,size,createdTime,"
+                    "ownedByMe,capabilities(canTrash,canEdit),"
+                    "owners(emailAddress)"
+                )
+            ).execute()
+
+            resolved.append(target)
+
+        except Exception:
+            # Target deleted or not shared — nothing to parse.
+            continue
+
+    return resolved
 
 
 def _list_folder(service, folder_id):
@@ -144,7 +211,8 @@ def _list_folder(service, folder_id):
                 "nextPageToken, "
                 "files(id,name,mimeType,md5Checksum,size,createdTime,"
                 "ownedByMe,capabilities(canTrash,canEdit),"
-                "owners(emailAddress))"
+                "owners(emailAddress),"
+                "shortcutDetails(targetId,targetMimeType))"
             ),
             pageSize=1000,
             pageToken=page_token

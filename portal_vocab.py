@@ -138,8 +138,12 @@ GRADE_LEVEL_SYNONYMS = {
     "net": "GATE / NET",
     "ugc net": "GATE / NET",
     "csir net": "GATE / NET",
-    "board": "Board Exams",
+    # NOT a bare "board": it matched "Board of Directors" and "notice
+    # board". The exam sense always carries a qualifying word.
     "board exam": "Board Exams",
+    "board exams": "Board Exams",
+    "boards": "Board Exams",
+    "board pattern": "Board Exams",
     "cbse": "Board Exams",
     "icse": "Board Exams",
     "state board": "Board Exams",
@@ -190,6 +194,20 @@ QUALIFICATION_SYNONYMS = {
     "mca": "MCA", "bca": "BCA",
     "d.el.ed": "D.El.Ed", "deled": "D.El.Ed",
     "ntt": "NTT",
+
+    "bachelor of arts": "B.A",
+    "bachelor of science": "B.Sc",
+    "bachelor of commerce": "B.Com",
+    "bachelor of education": "B.Ed",
+    "bachelor of technology": "B.Tech",
+    "bachelor of engineering": "B.Tech",
+    "master of arts": "M.A",
+    "master of science": "M.Sc",
+    "master of commerce": "M.Com",
+    "master of education": "M.Ed",
+    "master of technology": "M.Tech",
+    "master of computer applications": "MCA",
+    "master of business administration": "MBA",
 }
 
 JOB_TYPE_SYNONYMS = {

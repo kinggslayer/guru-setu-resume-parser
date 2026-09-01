@@ -96,7 +96,23 @@ def find_duplicate_groups(files, known_ids=None):
     return groups
 
 
-def summarise(groups):
-    """(number of duplicate files, number of groups) for the UI."""
+def summarise(groups, total_files=None):
+    """
+    Counts for the UI: (extra_copies, groups, files_involved, unique_files).
 
-    return sum(len(g["duplicates"]) for g in groups), len(groups)
+    total_files makes the last figure meaningful. Reporting only "617
+    duplicates across 409 sets" invites the reader to assume those two add
+    up to the folder — they don't, because files with no duplicate at all
+    appear in neither number.
+    """
+
+    extra_copies = sum(len(g["duplicates"]) for g in groups)
+
+    files_involved = extra_copies + len(groups)
+
+    unique_files = (
+        None if total_files is None
+        else max(total_files - files_involved, 0)
+    )
+
+    return extra_copies, len(groups), files_involved, unique_files
