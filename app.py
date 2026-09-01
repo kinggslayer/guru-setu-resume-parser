@@ -15,7 +15,6 @@ from drive_utils import (
     extract_folder_id,
     trash_file,
     has_user_credentials,
-    whoami,
 )
 
 from duplicates import find_duplicate_groups, summarise
@@ -185,6 +184,24 @@ def to_excel_bytes(df):
         df.to_excel(writer, index=False)
 
     return buffer.getvalue()
+
+
+def _whoami(owner_email=None):
+    """
+    Which Google account the app would act as, for error messages.
+
+    Imported lazily rather than at module load: it is a diagnostic nicety,
+    and a stale drive_utils on the server should degrade this one message
+    rather than stop the whole app from starting.
+    """
+
+    try:
+        from drive_utils import whoami
+
+        return whoami(owner_email)
+
+    except Exception:
+        return None
 
 
 def folder_id_for_save():
@@ -654,7 +671,7 @@ def render_duplicate_cleanup():
                     # Name BOTH accounts. A 403 here almost always means the
                     # saved token belongs to a different Gmail than the file
                     # owner, which is invisible without saying so.
-                    acting_as = whoami(
+                    acting_as = _whoami(
                         (denied[0][0].get("owners") or [{}])[0]
                         .get("emailAddress")
                     )
