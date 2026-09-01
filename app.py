@@ -15,6 +15,7 @@ from drive_utils import (
     extract_folder_id,
     trash_file,
     has_user_credentials,
+    whoami,
 )
 
 from duplicates import find_duplicate_groups, summarise
@@ -464,6 +465,52 @@ def render_duplicate_cleanup():
         "nothing was downloaded to find them."
     )
 
+    all_duplicates = [
+        duplicate
+        for group in groups
+        for duplicate in group["duplicates"]
+    ]
+
+    # canTrash was reported for the SERVICE ACCOUNT. When credentials for
+    # the file's OWNER are configured, the deletion runs as them instead,
+    # so that verdict no longer applies for those files.
+    def owner_of(duplicate):
+        owners = duplicate.get("owners") or []
+        return owners[0].get("emailAddress") if owners else None
+
+    as_user = any(
+        has_user_credentials(owner_of(d)) for d in all_duplicates
+    )
+
+    if as_user:
+        trashable = [
+            d for d in all_duplicates
+            if has_user_credentials(owner_of(d))
+            or d.get("capabilities", {}).get("canTrash") is not False
+        ]
+
+        missing_accounts = sorted({
+            owner_of(d) for d in all_duplicates
+            if d not in trashable and owner_of(d)
+        })
+
+        if missing_accounts:
+            st.info(
+                "No credentials for "
+                + ", ".join(missing_accounts)
+                + ". Add that account with `python cleanup_duplicates.py "
+                "--setup` to delete its files from here too."
+            )
+
+    else:
+        # Drive already said which files it will refuse. Offering a button
+        # that is certain to fail is worse than not showing it.
+        trashable = [
+            duplicate
+            for duplicate in all_duplicates
+            if duplicate.get("capabilities", {}).get("canTrash") is not False
+        ]
+
     rows = []
     blocked = []
 
@@ -493,7 +540,7 @@ def render_duplicate_cleanup():
 
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
-    if blocked and not has_user_credentials():
+    if blocked and not as_user:
 
         # canEdit separates the two very different causes. Without it the
         # advice is a guess, and the wrong guess wastes the user's time.
@@ -535,29 +582,6 @@ def render_duplicate_cleanup():
         "resume and pay for it again."
     )
 
-    all_duplicates = [
-        duplicate
-        for group in groups
-        for duplicate in group["duplicates"]
-    ]
-
-    # canTrash was reported for the SERVICE ACCOUNT. When the user's own
-    # OAuth credentials are configured the deletion runs as them instead,
-    # so that verdict no longer applies and everything is trashable.
-    as_user = has_user_credentials()
-
-    if as_user:
-        trashable = all_duplicates
-
-    else:
-        # Drive already said which files it will refuse. Offering a button
-        # that is certain to fail is worse than not showing it.
-        trashable = [
-            duplicate
-            for duplicate in all_duplicates
-            if duplicate.get("capabilities", {}).get("canTrash") is not False
-        ]
-
     if not trashable:
         st.info(
             "The app can't trash these itself — it signs in as the service "
@@ -586,8 +610,11 @@ def render_duplicate_cleanup():
 
         for duplicate in trashable:
 
+            owners = duplicate.get("owners") or []
+            owner_email = owners[0].get("emailAddress") if owners else None
+
             try:
-                trash_file(duplicate["id"])
+                trash_file(duplicate["id"], owner_email=owner_email)
                 trashed += 1
 
             except Exception as e:
@@ -623,12 +650,40 @@ def render_duplicate_cleanup():
                     )
 
                 else:
-                    st.warning(
-                        "Drive only lets a file's **owner** move it to trash, "
-                        "and the app is a separate account from your Gmail — "
-                        "so it can read and edit these, but not delete them. "
-                        "Remove them yourself; it's one click each:"
+
+                    # Name BOTH accounts. A 403 here almost always means the
+                    # saved token belongs to a different Gmail than the file
+                    # owner, which is invisible without saying so.
+                    acting_as = whoami(
+                        (denied[0][0].get("owners") or [{}])[0]
+                        .get("emailAddress")
                     )
+
+                    file_owner = (
+                        (denied[0][0].get("owners") or [{}])[0]
+                        .get("emailAddress", "unknown")
+                    )
+
+                    if acting_as and acting_as.lower() != file_owner.lower():
+                        st.error(
+                            f"Signed in as **{acting_as}**, but these files "
+                            f"are owned by **{file_owner}**. Only the owner "
+                            "can delete a file.\n\n"
+                            "Add the owner's account:\n\n"
+                            "`python cleanup_duplicates.py --setup --account "
+                            f"{file_owner}`\n\n"
+                            "then paste the new [[google_accounts]] block "
+                            "into Settings -> Secrets."
+                        )
+
+                    else:
+                        st.warning(
+                            "Drive refused the deletion even though the app "
+                            f"is signed in as {acting_as or 'your account'}. "
+                            "If these files were shared into your Drive by "
+                            "someone else, only they can delete them. "
+                            "Otherwise remove them yourself:"
+                        )
 
                     for duplicate, _ in denied:
                         st.markdown(
@@ -708,9 +763,10 @@ def process_resume(file_info, output_dir, existing_hashes):
     file_id = file_info["id"]
     file_name = file_info["name"]
 
+    file_path = os.path.join(output_dir, file_name)
+
     try:
 
-        file_path = os.path.join(output_dir, file_name)
         ocr_used = False
 
         if file_name.lower().endswith(".pdf"):
@@ -754,6 +810,19 @@ def process_resume(file_info, output_dir, existing_hashes):
     except Exception as e:
 
         return {"error": f"{file_name}: {str(e)}"}
+
+    finally:
+
+        # Delete the CV as soon as it has been parsed. Keeping ~1000 PDFs
+        # on disk for the whole run is what exhausts the container: the
+        # free tier has about 1 GB, and a large folder blows past it long
+        # before the run finishes, killing it with no output at all.
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+        except OSError:
+            pass
 
 
 if st.button("Process Resumes"):
@@ -950,116 +1019,161 @@ if st.button("Process Resumes"):
     existing_emails = set()
     existing_phones = set()
 
-    download_progress = st.progress(0)
-    process_progress = st.progress(0)
-
     st.write("Downloading + processing resumes...")
 
     results = []
     download_failures = []
-    total = len(files)
-    downloaded_count = 0
-    processed_count = 0
-
-    download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
-    groq_executor = ThreadPoolExecutor(max_workers=OPENAI_WORKERS)
 
     already_local = [f for f in files if f.get("uploaded")]
     files = [f for f in files if not f.get("uploaded")]
 
-    download_futures = {
-        download_executor.submit(
-            download_file, f["id"], f["name"], output_dir
-        ): f
-        for f in files
-    } if files else {}
+    queue = already_local + files
+    total = len(queue)
 
-    process_futures = {}
+    # ------------------------------------------------------------------
+    #  Batched processing.
+    #
+    #  Submitting a thousand downloads at once fills the container's disk
+    #  long before parsing drains it — downloads run 5-wide, parsing 2-wide
+    #  — and the free tier is killed at about 1 GB with no output at all.
+    #
+    #  Batching also means the master is saved as the run progresses, so a
+    #  crash at file 900 keeps the first 880 rather than losing everything.
+    # ------------------------------------------------------------------
+    batch_size = max(int(get_secret("BATCH_SIZE", 40) or 40), 1)
 
-    # Uploads need no download step, so they go straight to parsing.
-    for file_info in already_local:
+    overall_progress = st.progress(0.0)
+    status = st.empty()
 
-        process_futures[
-            groq_executor.submit(
-                process_resume, file_info, output_dir, existing_hashes
-            )
-        ] = file_info
+    processed_count = 0
+    saved_total = 0
 
-    for future in as_completed(download_futures):
+    for batch_start in range(0, total, batch_size):
 
-        file_info = download_futures[future]
-        downloaded_count += 1
-        if total:
-            download_progress.progress(downloaded_count / total)
+        batch = queue[batch_start:batch_start + batch_size]
 
-        try:
-            future.result()
-            process_future = groq_executor.submit(
-                process_resume,
-                file_info,
-                output_dir,
-                existing_hashes
-            )
-            process_futures[process_future] = file_info
+        status.write(
+            f"Batch {batch_start // batch_size + 1} of "
+            f"{(total + batch_size - 1) // batch_size} — "
+            f"{processed_count} of {total} files done"
+        )
 
-        except Exception as e:
-            download_failures.append({"name": file_info["name"], "error": str(e)})
-            st.error(f"Download failed: {file_info['name']} ({str(e)})")
+        download_executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
+        groq_executor = ThreadPoolExecutor(max_workers=OPENAI_WORKERS)
 
-    for future in as_completed(process_futures):
+        process_futures = {}
 
-        file_info = process_futures[future]
-        processed_count += 1
-        if process_futures:
-            process_progress.progress(processed_count / len(process_futures))
+        to_download = [f for f in batch if not f.get("uploaded")]
 
-        result = future.result()
+        download_futures = {
+            download_executor.submit(
+                download_file, f["id"], f["name"], output_dir
+            ): f
+            for f in to_download
+        }
 
-        if result:
+        # Uploads are already on disk, so they skip straight to parsing.
+        for file_info in [f for f in batch if f.get("uploaded")]:
+            process_futures[
+                groq_executor.submit(
+                    process_resume, file_info, output_dir, existing_hashes
+                )
+            ] = file_info
+
+        for future in as_completed(download_futures):
+
+            file_info = download_futures[future]
+
+            try:
+                future.result()
+
+                process_futures[
+                    groq_executor.submit(
+                        process_resume, file_info, output_dir, existing_hashes
+                    )
+                ] = file_info
+
+            except Exception as e:
+                download_failures.append(
+                    {"name": file_info["name"], "error": str(e)}
+                )
+                st.error(f"Download failed: {file_info['name']} ({str(e)})")
+
+        for future in as_completed(process_futures):
+
+            processed_count += 1
+
+            if total:
+                overall_progress.progress(min(processed_count / total, 1.0))
+
+            result = future.result()
+
+            if not result:
+                continue
+
             if "error" in result:
                 st.error(result["error"])
-            else:
+                continue
+
+            if (
+                not result.get("extraction_failed")
+                and not result.get("duplicate_of_content")
+            ):
+
+                # blank_safe, NOT str(...): result["email"] is None when no
+                # address was found, and str(None) is the truthy string
+                # "none" — which then matches every other record that also
+                # had no email, silently dropping them.
+                email = blank_safe(result.get("email")).lower()
+                phone = blank_safe(result.get("phone"))
 
                 if (
-                    not result.get("extraction_failed")
-                    and not result.get("duplicate_of_content")
+                    (email and email in existing_emails)
+                    or (phone and phone in existing_phones)
                 ):
+                    result["skipped_existing_contact"] = True
+                    results.append(result)
+                    continue
 
-                    # blank_safe, NOT str(...): result["email"] is None when
-                    # no address was found, and str(None) is the truthy
-                    # string "none" — which then matches every other record
-                    # that also had no email, silently dropping them.
-                    email = blank_safe(result.get("email")).lower()
-                    phone = blank_safe(result.get("phone"))
+                result["keep"] = True
 
-                    if (email and email in existing_emails) or (phone and phone in existing_phones):
+                if result.get("content_hash"):
+                    existing_hashes.add(str(result["content_hash"]))
 
-                        st.warning(
-                            "Skipping "
-                            f"{result.get('resume_file_name', 'a file')}: "
-                            f"{result.get('full_name') or '(no name)'} has the "
-                            "same email or phone as a resume already parsed "
-                            "in this run."
-                        )
+                if email:
+                    existing_emails.add(email)
+                if phone:
+                    existing_phones.add(phone)
 
-                        result["skipped_existing_contact"] = True
-                        results.append(result)
-                        continue
+            results.append(result)
 
-                    result["keep"] = True
+        download_executor.shutdown(wait=True)
+        groq_executor.shutdown(wait=True)
 
-                    if result.get("content_hash"):
-                        existing_hashes.add(str(result["content_hash"]))
+        # Save what this batch produced before starting the next one.
+        batch_keepers = [
+            r for r in results[saved_total:] if r.get("keep")
+        ]
 
-                    if email:
-                        existing_emails.add(email)
-                    if phone:
-                        existing_phones.add(phone)
+        saved_total = len(results)
 
-                results.append(result)
+        if batch_keepers:
 
-    download_executor.shutdown(wait=True)
-    groq_executor.shutdown(wait=True)
+            try:
+                master_df, batch_added, _ = merge_into_master(
+                    master_df, to_master_rows(batch_keepers)
+                )
+
+                save_master(folder_id, master_df, master_file_id)
+
+            except Exception as e:
+                st.error(
+                    f"Could not save after this batch: {e} "
+                    "Processing continues, but stop and fix this — later "
+                    "batches may be lost too."
+                )
+
+    status.write(f"Processed {processed_count} of {total} files.")
 
     duplicate_content_count = sum(1 for r in results if r.get("duplicate_of_content"))
     skipped_existing_count = sum(1 for r in results if r.get("skipped_existing_contact"))
@@ -1152,7 +1266,13 @@ if st.button("Process Resumes"):
         # -----------------------------------------------------------------
         new_rows = to_master_rows(unique_results)
 
-        master_df, added, merge_report = merge_into_master(master_df, new_rows)
+        # Rows were merged and saved batch by batch as the run progressed.
+        # Merging again is a no-op for the data — every row is already
+        # present — but it recomputes the report so the duplicate summary
+        # below covers the whole run rather than only the last batch.
+        master_df, _, merge_report = merge_into_master(master_df, new_rows)
+
+        added = len([r for r in unique_results if r.get("keep")])
 
         from_master = [
             item for item in merge_report
@@ -1194,6 +1314,8 @@ if st.button("Process Resumes"):
             )
 
         try:
+            # Safety net: batches already saved, this catches anything the
+            # final merge changed.
             save_master(folder_id, master_df, master_file_id)
 
             where = (

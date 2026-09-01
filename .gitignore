@@ -19,3 +19,4 @@ Caddyfile.local
 # OAuth files for cleanup_duplicates.py — never commit these
 client_secret.json
 token.json
+token_*.json

@@ -394,13 +394,13 @@ def upload_bytes_by_id(file_id, data, mimetype, service=None):
     ).execute()
 
 
-def trash_file(file_id, service=None):
+def trash_file(file_id, service=None, owner_email=None):
     """
     Move a file to the Drive trash.
 
-    Prefers the user's own credentials when configured, because the service
-    account cannot trash files it does not own — which is every file the
-    user uploaded themselves.
+    owner_email selects which account to act as. Only a file's owner may
+    trash it, so with several Gmails configured the right one has to be
+    chosen per file — the service account can never do it.
 
     Deliberately NOT files().delete(), which is permanent and unrecoverable.
     Trashed files sit in Drive's bin for 30 days, so a wrong call here can
@@ -408,7 +408,18 @@ def trash_file(file_id, service=None):
     """
 
     if service is None:
-        service = get_user_drive_service() or get_drive_service()
+
+        service = get_user_drive_service(owner_email)
+
+        if service is None:
+            # Deliberately NOT falling back to the service account: it can
+            # never trash a file it doesn't own, so the fallback would only
+            # turn a clear "no credentials" into a confusing 403.
+            raise PermissionError(
+                f"No Google account credentials configured for {owner_email}. "
+                "Run: python cleanup_duplicates.py --setup --account "
+                f"{owner_email}"
+            )
 
     return service.files().update(
         fileId=file_id,
@@ -448,31 +459,118 @@ def _oauth_setting(name):
     return os.getenv(name)
 
 
-def has_user_credentials():
-    """True when all three OAuth values are configured."""
-
-    return all(_oauth_setting(key) for key in USER_OAUTH_KEYS)
-
-
-def get_user_drive_service():
+def _accounts_from_secrets():
     """
-    A Drive client authenticated as the user.
+    Every Google account the app can act as, as {email: refresh_token}.
 
-    Returns None when OAuth isn't configured, so callers can fall back to
-    the service account rather than crash.
+    Two shapes are accepted. A [[google_accounts]] array of tables covers
+    several Gmails; the single GOOGLE_OAUTH_REFRESH_TOKEN is kept working
+    so an existing setup doesn't break when a second account is added.
     """
 
-    if not has_user_credentials():
+    accounts = {}
+
+    try:
+        listed = st.secrets.get("google_accounts", [])
+
+    except Exception:
+        listed = []
+
+    for entry in listed or []:
+
+        email = str(entry.get("email", "")).strip().lower()
+        token = str(entry.get("refresh_token", "")).strip()
+
+        if email and token:
+            accounts[email] = token
+
+    single = _oauth_setting("GOOGLE_OAUTH_REFRESH_TOKEN")
+
+    if single:
+        email = str(
+            _oauth_setting("GOOGLE_OAUTH_EMAIL") or "default"
+        ).strip().lower()
+
+        accounts.setdefault(email, single)
+
+    return accounts
+
+
+def has_user_credentials(owner_email=None):
+    """
+    Whether the app can act as a user.
+
+    owner_email asks specifically about that account — the answer differs
+    per file, because a token for one Gmail cannot delete another Gmail's
+    files, and claiming otherwise would produce a button that always fails.
+    """
+
+    if not (
+        _oauth_setting("GOOGLE_OAUTH_CLIENT_ID")
+        and _oauth_setting("GOOGLE_OAUTH_CLIENT_SECRET")
+    ):
+        return False
+
+    accounts = _accounts_from_secrets()
+
+    if not accounts:
+        return False
+
+    if owner_email is None:
+        return True
+
+    email = str(owner_email).strip().lower()
+
+    # "default" is the single-account setup, which predates per-account
+    # tokens and so can't be matched against an owner — assume it fits.
+    return email in accounts or "default" in accounts
+
+
+def get_user_drive_service(owner_email=None):
+    """
+    A Drive client authenticated as the user who owns the file.
+
+    Returns None when no suitable account is configured, so callers can
+    fall back rather than crash.
+    """
+
+    accounts = _accounts_from_secrets()
+
+    if not accounts:
         return None
 
-    if getattr(_thread_local, "user_service", None) is not None:
-        return _thread_local.user_service
+    email = str(owner_email or "").strip().lower()
+
+    if email and email in accounts:
+        token = accounts[email]
+        cache_key = email
+
+    elif "default" in accounts:
+        token = accounts["default"]
+        cache_key = "default"
+
+    elif not email:
+        cache_key = next(iter(accounts))
+        token = accounts[cache_key]
+
+    else:
+        # A token exists, but not for this owner — using it would fail.
+        return None
+
+    cache = getattr(_thread_local, "user_services", None)
+
+    if cache is None:
+        cache = {}
+        _thread_local.user_services = cache
+
+    if cache_key in cache:
+        return cache[cache_key]
 
     from google.oauth2.credentials import Credentials
 
     creds = Credentials(
         token=None,
-        refresh_token=_oauth_setting("GOOGLE_OAUTH_REFRESH_TOKEN"),
+        refresh_token=token,
         client_id=_oauth_setting("GOOGLE_OAUTH_CLIENT_ID"),
         client_secret=_oauth_setting("GOOGLE_OAUTH_CLIENT_SECRET"),
         token_uri="https://oauth2.googleapis.com/token",
@@ -481,6 +579,31 @@ def get_user_drive_service():
 
     service = build("drive", "v3", credentials=creds)
 
-    _thread_local.user_service = service
+    cache[cache_key] = service
 
     return service
+
+
+
+
+def whoami(owner_email=None):
+    """
+    The email of the account the app would act as for this owner.
+
+    Used in error messages: a 403 while "acting as the user" almost always
+    means the token belongs to a different Gmail than the file's owner, and
+    naming both makes that obvious instead of mysterious.
+    """
+
+    service = get_user_drive_service(owner_email)
+
+    if service is None:
+        return None
+
+    try:
+        about = service.about().get(fields="user(emailAddress)").execute()
+
+        return about.get("user", {}).get("emailAddress")
+
+    except Exception:
+        return None

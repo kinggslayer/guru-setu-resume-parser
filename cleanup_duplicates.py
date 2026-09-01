@@ -51,13 +51,27 @@ CLIENT_SECRET_FILE = "client_secret.json"
 TOKEN_FILE = "token.json"
 
 
-def get_credentials():
+def token_file_for(account):
+    """
+    Separate token file per account, so authorising a second Gmail doesn't
+    overwrite the first one's token.
+    """
+
+    if not account:
+        return TOKEN_FILE
+
+    safe = "".join(c for c in account if c.isalnum() or c in "-_.@")
+
+    return f"token_{safe}.json"
+
+
+def get_credentials(token_file=TOKEN_FILE):
     """Sign in as the user, reusing the saved token when it's still good."""
 
     creds = None
 
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
 
     if not creds or not creds.valid:
 
@@ -78,7 +92,7 @@ def get_credentials():
 
             creds = flow.run_local_server(port=0)
 
-        with open(TOKEN_FILE, "w", encoding="utf-8") as handle:
+        with open(token_file, "w", encoding="utf-8") as handle:
             handle.write(creds.to_json())
 
     return creds
@@ -128,6 +142,26 @@ def list_files(service, folder_id):
     return files
 
 
+def signed_in_email(creds):
+    """
+    Which Google account just signed in.
+
+    Asked of Drive rather than assumed, so the [[google_accounts]] entry
+    carries the right address — matching files to accounts by owner is the
+    whole point, and a wrong email silently disables deletion.
+    """
+
+    try:
+        service = build("drive", "v3", credentials=creds)
+
+        about = service.about().get(fields="user(emailAddress)").execute()
+
+        return about.get("user", {}).get("emailAddress")
+
+    except Exception:
+        return None
+
+
 def print_secrets_block(creds):
     """
     Print the OAuth values to paste into the Streamlit app's secrets, so
@@ -148,10 +182,22 @@ def print_secrets_block(creds):
     print("  Paste this into the app: Settings -> Secrets")
     print("  Then the app's 'Move duplicates to trash' button will work.")
     print("=" * 68)
+    email = signed_in_email(creds) or "REPLACE_WITH_THIS_ACCOUNTS_EMAIL"
+
+    print()
+    print("  The client id/secret are shared by all accounts — if they are")
+    print("  already in your secrets, add only the [[google_accounts]] block.")
     print()
     print(f'GOOGLE_OAUTH_CLIENT_ID = "{creds.client_id}"')
     print(f'GOOGLE_OAUTH_CLIENT_SECRET = "{creds.client_secret}"')
-    print(f'GOOGLE_OAUTH_REFRESH_TOKEN = "{creds.refresh_token}"')
+    print()
+    print("[[google_accounts]]")
+    print(f'email = "{email}"')
+    print(f'refresh_token = "{creds.refresh_token}"')
+    print()
+    print("  Repeat --setup signed in as another Gmail to add a second")
+    print("  [[google_accounts]] block. Each account can only delete its")
+    print("  OWN files, which is why one token per Gmail is needed.")
     print()
     print("=" * 68)
     print("  Keep these private — they let the holder act as your Google")
@@ -162,7 +208,15 @@ def print_secrets_block(creds):
 def main():
 
     if "--setup" in sys.argv:
-        creds = get_credentials()
+
+        # --account lets a second Gmail be authorised without clobbering
+        # the first account's saved token.
+        account = None
+
+        if "--account" in sys.argv:
+            account = sys.argv[sys.argv.index("--account") + 1]
+
+        creds = get_credentials(token_file_for(account))
         print_secrets_block(creds)
         return
 
