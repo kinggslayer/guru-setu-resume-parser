@@ -18,5 +18,48 @@ maxUploadSize = 50
 [browser]
 gatherUsageStats = false
 
+
+# ---------------------------------------------------------------------------
+#  Theme
+#
+#  No `base` is set on purpose. With both [theme.light] and [theme.dark]
+#  defined and no base, the app follows the viewer's system preference and
+#  they can still override it in the app menu -> Settings -> Appearance.
+#  Pinning base = "light" (as before) forced everyone into light mode and
+#  made that menu do nothing.
+# ---------------------------------------------------------------------------
+
 [theme]
-base = "light"
+font = "sans-serif"
+baseRadius = "0.5rem"
+showWidgetBorder = true
+
+[theme.light]
+primaryColor = "#2563eb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6fa"
+textColor = "#1a1d24"
+linkColor = "#2563eb"
+borderColor = "#dfe3ea"
+dataframeHeaderBackgroundColor = "#eef1f6"
+codeBackgroundColor = "#f4f6fa"
+
+[theme.dark]
+# Slightly lifted off pure black: a long review session on a large grid is
+# easier to read against #12151c than #000000.
+primaryColor = "#6ea8fe"
+backgroundColor = "#12151c"
+secondaryBackgroundColor = "#1b1f2a"
+textColor = "#e6e9ef"
+linkColor = "#6ea8fe"
+borderColor = "#2c313d"
+dataframeHeaderBackgroundColor = "#1b1f2a"
+codeBackgroundColor = "#1b1f2a"
+
+# The status colours matter here: the review warnings and error boxes are
+# how the app communicates, and the defaults are tuned for a light page.
+redColor = "#ff8a8a"
+orangeColor = "#ffbf7a"
+yellowColor = "#ffd97a"
+greenColor = "#7ee2a8"
+blueColor = "#6ea8fe"

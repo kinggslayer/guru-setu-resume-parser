@@ -240,6 +240,12 @@ def master_file_id_for_save():
     return extract_file_id(master_link)
 
 
+# Above this many rows the editable grid is switched off by default: the
+# whole frame is sent to the browser, and a few thousand rows of a
+# 30-column editor stalls it.
+PREVIEW_ROW_LIMIT = 300
+
+
 def render_review_and_download(state_key, file_name, heading):
     """
     Show the editable review grid for whatever is in st.session_state[state_key]
@@ -267,6 +273,50 @@ def render_review_and_download(state_key, file_name, heading):
 
         return
 
+    # ------------------------------------------------------------------
+    #  Download first, preview second.
+    #
+    #  The editable grid is by far the heaviest thing on the page — a few
+    #  thousand rows of it can stall the browser. The download must never
+    #  depend on it rendering, so it is offered before the grid and works
+    #  with the preview switched off entirely.
+    # ------------------------------------------------------------------
+    st.subheader(heading)
+
+    show_preview = st.checkbox(
+        "Show the editable preview",
+        value=len(df) <= PREVIEW_ROW_LIMIT,
+        key=f"preview_{state_key}",
+        help=(
+            "Turn this off to download without rendering the grid. The "
+            "file is identical either way."
+        )
+    )
+
+    if not show_preview:
+
+        clean = strip_review_column(df)
+
+        if SOURCE_FILE_ID in clean.columns:
+            clean = clean.drop(columns=[SOURCE_FILE_ID])
+
+        st.write(f"{len(clean)} teachers ready to download.")
+
+        st.download_button(
+            label=f"Download portal import file ({len(clean)} teachers)",
+            data=to_excel_bytes(clean),
+            file_name=file_name,
+            mime=EXCEL_MIME,
+            type="primary",
+            key=f"download_nopreview_{state_key}"
+        )
+
+        st.caption(
+            "Preview is off. Tick the box above to review and edit rows."
+        )
+
+        return
+
     # Hide the tracking columns: they're for dedup, not for editing, and
     # showing them makes the grid far harder to scan. The file id is kept
     # (hidden in the editor) so edits can be matched back to master rows.
@@ -274,8 +324,6 @@ def render_review_and_download(state_key, file_name, heading):
 
     if REVIEW_COLUMN not in df.columns:
         df = add_review_column(df)
-
-    st.subheader(heading)
 
     # ------------------------------------------------------------------
     #  Filter and search.
@@ -319,9 +367,21 @@ def render_review_and_download(state_key, file_name, heading):
     if len(df) != total_rows:
         st.caption(f"Showing {len(df)} of {total_rows} rows.")
 
+
     if df.empty:
         st.info("Nothing matches. Clear the search or filter to see the rest.")
         return
+
+    # Cap what the editor renders. Streamlit sends the whole frame to the
+    # browser, and a few thousand rows of a 30-column editor is enough to
+    # stall it. The download above always covers everything.
+    if len(df) > PREVIEW_ROW_LIMIT:
+        st.info(
+            f"Showing the first {PREVIEW_ROW_LIMIT} of {len(df)} rows in the "
+            "editor. Use the search box to reach any other row — the "
+            "download always contains all of them."
+        )
+        df = df.head(PREVIEW_ROW_LIMIT)
 
     flagged_before = count_flagged(df)
 
