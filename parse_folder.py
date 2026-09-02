@@ -81,6 +81,7 @@ from master_store import (
 )
 from duplicates import find_duplicate_groups, summarise
 from skiplist import load_failed, save_failed, reason_for
+from jobs import claim_next_job, update_job
 from usage import tracker
 
 
@@ -202,6 +203,72 @@ def save_with_retries(folder_id, master_df, master_file_id):
     return False
 
 
+def watch(args):
+    """
+    Worker loop: take queued folders and parse them.
+
+    Runs anywhere that stays awake — the EC2 box, or a desktop left on.
+    Staff queue folders from the web app and never touch a terminal.
+    """
+
+    queue_folder = extract_folder_id(args.watch)
+
+    worker_name = os.getenv("WORKER_NAME") or f"worker-{os.getpid()}"
+
+    log(f"Watching the queue in folder {queue_folder} as {worker_name}.")
+    log(f"Checking every {args.poll}s. Ctrl+C to stop.")
+
+    while True:
+
+        try:
+            job = claim_next_job(queue_folder, worker_name)
+
+        except Exception as e:
+            log(f"Could not read the queue: {e}")
+            time.sleep(args.poll)
+            continue
+
+        if job is None:
+            time.sleep(args.poll)
+            continue
+
+        log(f"Job {job['id']}: {job.get('folder_link')}")
+
+        try:
+            job_args = argparse.Namespace(
+                folder=job.get("folder_link"),
+                master=job.get("master_link") or None,
+                batch=args.batch,
+                limit=0,
+                no_subfolders=False,
+                retry_failed=False,
+                watch=None,
+                poll=args.poll,
+                _job=(queue_folder, job["id"]),
+            )
+
+            code = run_once(job_args)
+
+            update_job(
+                queue_folder, job["id"],
+                status="done" if code == 0 else "failed",
+                progress="finished" if code == 0 else "stopped early",
+            )
+
+            log(f"Job {job['id']} {'done' if code == 0 else 'failed'}.")
+
+        except KeyboardInterrupt:
+            update_job(queue_folder, job["id"], status="queued",
+                       progress="interrupted, will retry")
+            log("Interrupted; job returned to the queue.")
+            raise
+
+        except Exception as e:
+            # Never let one bad job stop the worker.
+            update_job(queue_folder, job["id"], status="failed", error=str(e))
+            log(f"Job {job['id']} failed: {e}")
+
+
 def main():
 
     parser = argparse.ArgumentParser(
@@ -219,7 +286,23 @@ def main():
                         help="stop after this many files (trial run)")
     parser.add_argument("--no-subfolders", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument(
+        "--watch", metavar="FOLDER_LINK", default=None,
+        help="run as a worker: poll that folder's queue and parse what "
+             "staff submit from the app"
+    )
+    parser.add_argument("--poll", type=int, default=60,
+                        help="seconds between queue checks in --watch mode")
     args = parser.parse_args()
+
+    if args.watch:
+        return watch(args)
+
+    return run_once(args)
+
+
+def run_once(args):
+    """Parse one folder. Shared by the CLI and the worker."""
 
     if not os.getenv("OPENAI_API_KEY"):
         sys.exit("OPENAI_API_KEY is not set. Put it in .env next to this file.")
@@ -227,6 +310,9 @@ def main():
     # The link may be given on the command line or, for a folder parsed
     # regularly, left in .env so the command is just `python parse_folder.py`.
     folder_link = args.folder or os.getenv("DRIVE_FOLDER_LINK") or ""
+
+    # Set when running a queued job, so progress reaches the app.
+    job_ref = getattr(args, "_job", None)
 
     if not folder_link.strip():
         sys.exit(
@@ -436,6 +522,15 @@ def main():
         log(f"Batch {batch_number}/{total_batches}: "
             f"{len(batch)} files, {len(keepers)} parsed, {batch_added} added, "
             f"master now {len(master_df)} | {done}/{total} done")
+
+        if job_ref:
+            update_job(
+                job_ref[0], job_ref[1],
+                progress=(
+                    f"batch {batch_number}/{total_batches}, "
+                    f"{done}/{total} files, {added_total} added"
+                )
+            )
 
     shutil.rmtree(WORK_DIR, ignore_errors=True)
 

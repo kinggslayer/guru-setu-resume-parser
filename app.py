@@ -22,6 +22,8 @@ from duplicates import find_duplicate_groups, summarise
 
 from skiplist import load_failed, save_failed, reason_for
 
+from jobs import add_job, load_jobs, describe
+
 from usage import tracker
 
 from extractor import (
@@ -994,7 +996,81 @@ def process_resume(file_info, output_dir, existing_hashes):
             pass
 
 
-if st.button("Process Resumes"):
+# ---------------------------------------------------------------------------
+#  Queue for background parsing
+#
+#  Parsing in the browser dies when the laptop sleeps, and the command-line
+#  runner needs Python and credentials that staff won't have. Queueing puts
+#  the job on a worker instead: click, close the tab, come back later.
+# ---------------------------------------------------------------------------
+
+queue_col, run_col = st.columns([1, 1])
+
+with queue_col:
+    queue_clicked = st.button(
+        "Queue for background parsing",
+        help=(
+            "Hands the folder to the worker. You can close this tab; "
+            "results appear in the master database as it goes."
+        )
+    )
+
+with run_col:
+    run_clicked = st.button("Process Resumes now")
+
+if queue_clicked:
+
+    links = [l.strip() for l in str(drive_link).splitlines() if l.strip()]
+
+    if not links:
+        st.error("Paste a Drive folder link first.")
+
+    else:
+
+        for link in links:
+
+            try:
+                target = extract_folder_id(link)
+
+            except ValueError:
+                st.error(f"Not a Drive folder link: {link}")
+                continue
+
+            job, message = add_job(
+                target, link, master_link=master_link or ""
+            )
+
+            if job:
+                st.success(f"{message} The worker will pick it up shortly.")
+            else:
+                st.error(message)
+
+
+# Show what the worker is doing, for whoever queued it.
+_status_folder = folder_id_for_save()
+
+if _status_folder:
+
+    _jobs = load_jobs(_status_folder)
+
+    if _jobs:
+
+        with st.expander(
+            "Background jobs",
+            expanded=any(j.get("status") in ("queued", "running") for j in _jobs)
+        ):
+            st.dataframe(
+                pd.DataFrame([describe(j) for j in _jobs[::-1]]),
+                width="stretch",
+                hide_index=True
+            )
+            st.caption(
+                "Refresh this page to update. Results land in the master "
+                "database below as each batch completes."
+            )
+
+
+if run_clicked:
 
     if not drive_link and not uploaded_files:
         st.error(
