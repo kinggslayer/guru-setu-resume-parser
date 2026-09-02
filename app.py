@@ -599,7 +599,8 @@ def render_duplicate_cleanup():
         groups, total_scanned
     )
 
-    st.subheader("Duplicate files in this folder")
+    st.divider()
+    st.subheader("Housekeeping: duplicate files in this folder")
 
     message = (
         f"{group_count} set(s) of identical files, holding {involved} files "
@@ -875,8 +876,9 @@ def render_bottom_panels():
     precisely what a user wants after re-running an already-parsed folder.
     """
 
-    render_duplicate_cleanup()
-
+    # Results FIRST. The duplicate table can run to hundreds of rows and
+    # was pushing the actual output far below the fold — the point of the
+    # run is the candidates, not the housekeeping.
     render_review_and_download(
         state_key="run_df",
         file_name="guru_setu_teacher_import_this_run.xlsx",
@@ -888,6 +890,8 @@ def render_bottom_panels():
         file_name="guru_setu_teacher_import_all.xlsx",
         heading="Master database — review and download"
     )
+
+    render_duplicate_cleanup()
 
 
 def blank_safe(value):
@@ -1459,6 +1463,25 @@ if st.button("Process Resumes"):
                 f"Saved: {len(master_df)} candidates in the master. "
                 f"{processed_count} of {total} files done."
             )
+
+        # Publish after EVERY batch, not only when the loop finishes.
+        #
+        # Session state was set at the end of the run, so a run stopped by
+        # a reload, a container kill or an early st.stop() left nothing to
+        # render — the page showed the duplicate table and then blank,
+        # which reads as "no output" even though rows were safely saved.
+        st.session_state["master_df"] = master_df
+
+        run_ids_so_far = {
+            str(r.get("file_id")).strip()
+            for r in results if r.get("keep") and r.get("file_id")
+        }
+
+        if run_ids_so_far and SOURCE_FILE_ID in master_df.columns:
+            st.session_state["run_df"] = master_df[
+                master_df[SOURCE_FILE_ID]
+                .astype(str).str.strip().isin(run_ids_so_far)
+            ].reset_index(drop=True)
 
         # Log every batch, including ones that produced nothing — a run of
         # empty batches is exactly the signal worth seeing early.
