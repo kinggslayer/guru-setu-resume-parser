@@ -178,6 +178,25 @@ with st.expander("Settings", expanded=not st.session_state["master_link"]):
         "resets when the app restarts."
     )
 
+    st.divider()
+
+    # Streamlit delivers the theme once, in the websocket handshake at
+    # connection time, and no theme option is scriptable — so an in-app
+    # toggle cannot actually change it. Point at the control that works
+    # instead of shipping a button that quietly does nothing.
+    try:
+        theme = getattr(st.context, "theme", None)
+        current = getattr(theme, "type", None) or "your system setting"
+    except Exception:
+        current = "your system setting"
+
+    st.markdown(
+        f"**Appearance** - currently *{current}*. "
+        "Switch between light and dark from the menu at the top right "
+        "(the three dots) -> Settings -> Appearance. Both themes are "
+        "defined for this app."
+    )
+
 master_link = st.session_state["master_link"]
 
 OPENAI_WORKERS = int(get_secret("OPENAI_WORKERS", 2))
