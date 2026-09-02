@@ -15,6 +15,7 @@ from drive_utils import (
     extract_folder_id,
     trash_file,
     has_user_credentials,
+    local_name_for,
 )
 
 from duplicates import find_duplicate_groups, summarise
@@ -922,7 +923,9 @@ def process_resume(file_info, output_dir, existing_hashes):
     file_id = file_info["id"]
     file_name = file_info["name"]
 
-    file_path = os.path.join(output_dir, file_name)
+    # Must match what download_file wrote — keyed on the Drive id, because
+    # two files in one folder can share a name.
+    file_path = os.path.join(output_dir, local_name_for(file_id, file_name))
 
     try:
 
@@ -946,7 +949,14 @@ def process_resume(file_info, output_dir, existing_hashes):
 
         content_hash = hash_text(text)
 
-        if content_hash in existing_hashes:
+        # An unreadable file hashes to the hash of empty text, which is the
+        # same for every unreadable file. Only text with real content can
+        # be used to judge two resumes identical — otherwise the first scan
+        # would make every later scan look like a duplicate of it.
+        if len(text.strip()) < MIN_USABLE_CHARS:
+            content_hash = ""
+
+        if content_hash and content_hash in existing_hashes:
             return {
                 "duplicate_of_content": True,
                 "resume_file_name": file_name,
@@ -1062,7 +1072,10 @@ if st.button("Process Resumes"):
 
         upload_id = "upload-" + hashlib.sha256(data).hexdigest()[:24]
 
-        with open(os.path.join(output_dir, upload.name), "wb") as handle:
+        with open(
+            os.path.join(output_dir, local_name_for(upload_id, upload.name)),
+            "wb"
+        ) as handle:
             handle.write(data)
 
         files.append({
@@ -1270,7 +1283,20 @@ if st.button("Process Resumes"):
     # rows of nothing until the very end.
     batch_log = []
     batch_log_area = st.empty()
+    running_total_area = st.empty()
     latest_rows_area = st.empty()
+
+    # Cumulative reasons, so "250 parsed but only 100 saved" is answerable
+    # at any moment — including on a run that gets cancelled before the
+    # end-of-run reconciliation table is ever drawn.
+    tally = {
+        "added": 0,
+        "already_in_master": 0,
+        "same_person_this_run": 0,
+        "identical_text": 0,
+        "scans": 0,
+        "failed": 0,
+    }
 
     processed_count = 0
     saved_total = 0
@@ -1364,7 +1390,9 @@ if st.button("Process Resumes"):
 
                 result["keep"] = True
 
-                if result.get("content_hash"):
+                # Guarded above, but stated here too: never seed the
+                # duplicate set with an empty-text hash.
+                if blank_safe(result.get("content_hash")):
                     existing_hashes.add(str(result["content_hash"]))
 
                 if email:
@@ -1405,12 +1433,24 @@ if st.button("Process Resumes"):
         if new_failures:
             save_failed(folder_id, previously_failed)
 
+        batch_added = 0
+        batch_already_known = 0
+
         if batch_keepers:
 
             try:
-                master_df, batch_added, _ = merge_into_master(
+                master_df, batch_added, batch_report = merge_into_master(
                     master_df, to_master_rows(batch_keepers)
                 )
+
+                # Parsed-but-not-added: the same PERSON is already in the
+                # master under a different file. Counting these as "new"
+                # made the master total look stuck while the log claimed
+                # rows were being added.
+                batch_already_known = len([
+                    item for item in batch_report
+                    if item.get("origin") != "master"
+                ])
 
             except Exception as e:
                 st.error(f"Could not merge this batch: {e}")
@@ -1493,14 +1533,55 @@ if st.button("Process Resumes"):
             for r in batch_results if r.get("keep")
         ]
 
+        tally["added"] += batch_added
+        tally["already_in_master"] += batch_already_known
+        tally["same_person_this_run"] += sum(
+            1 for r in batch_results if r.get("skipped_existing_contact")
+        )
+        tally["identical_text"] += sum(
+            1 for r in batch_results if r.get("duplicate_of_content")
+        )
+        tally["scans"] += sum(1 for r in batch_results if r.get("needs_ocr"))
+        tally["failed"] += sum(
+            1 for r in batch_results
+            if r.get("extraction_failed") and not r.get("needs_ocr")
+        )
+
+        accounted = sum(tally.values())
+
+        running_total_area.markdown(
+            f"**Of {processed_count} files parsed so far:** "
+            f"{tally['added']} added to the master · "
+            f"{tally['already_in_master']} already there (same person, "
+            f"different file) · "
+            f"{tally['same_person_this_run']} repeated within this run · "
+            f"{tally['identical_text']} identical text · "
+            f"{tally['scans']} unreadable scans · "
+            f"{tally['failed']} extraction errors"
+            + ("" if accounted == processed_count else
+               f" · **{processed_count - accounted} unaccounted — tell me**")
+        )
+
         batch_log.append({
             "Batch": f"{batch_number}/{total_batches}",
             "Files": len(batch_results),
-            "New": len(batch_keepers),
-            "Skipped": len(batch_results) - len(batch_keepers),
+            "Parsed": len(batch_keepers),
+            "Added": batch_added,
+            "Already known": batch_already_known,
+            "Not usable": len(batch_results) - len(batch_keepers),
             "Master total": len(master_df),
-            "Names": ", ".join(names[:6]) + ("..." if len(names) > 6 else ""),
+            "Names": ", ".join(names[:5]) + ("..." if len(names) > 5 else ""),
         })
+
+        if batch_already_known and not st.session_state.get("_known_note"):
+            st.session_state["_known_note"] = True
+            st.info(
+                "Some parsed candidates are already in the master under a "
+                "different file — same name and phone. They are counted "
+                "under 'Already known' and the master total stays put. "
+                "That is the duplicate rule working, not a failed save; "
+                "'Master total' rises only for genuinely new people."
+            )
 
         # Newest first: on a long run the interesting row is the last one,
         # and scrolling to the bottom of a growing table every time is

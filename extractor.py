@@ -409,6 +409,11 @@ def ocr_pdf(file_path):
     the caller just sees an unreadable document rather than an exception.
     """
 
+    # MOCK_MODE bypassed the extraction call but not this one, so a test
+    # run still made real (and comparatively expensive) vision requests.
+    if os.getenv("MOCK_MODE", "false").lower() == "true":
+        return "MOCK OCR TEXT. " * 40
+
     try:
         images = render_pdf_pages(file_path)
 

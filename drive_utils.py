@@ -228,13 +228,40 @@ def _list_folder(service, folder_id):
     return items
 
 
+def local_name_for(file_id, file_name):
+    """
+    A collision-proof local filename for a Drive file.
+
+    Naming the download after the Drive file name alone is unsafe: two
+    different files in a folder can share a name ("cv.pdf" twice), and they
+    then share one path. The second download overwrites the first, so the
+    first file is parsed using the SECOND file's contents — one candidate
+    silently recorded from someone else's resume — and the second parse
+    finds nothing because the first already deleted the path.
+
+    The Drive id is unique, so prefixing with it removes the collision.
+    The extension is preserved because the parser dispatches on it.
+    """
+
+    safe_id = "".join(c for c in str(file_id) if c.isalnum() or c in "-_")
+
+    base = os.path.basename(str(file_name or "file"))
+
+    # Strip anything a filesystem would object to, keeping the extension.
+    safe_name = "".join(
+        c if (c.isalnum() or c in "-_. ") else "_" for c in base
+    ).strip() or "file"
+
+    return f"{safe_id}__{safe_name}"
+
+
 def download_file(file_id, file_name, output_dir):
 
     service = get_drive_service()
 
     request = service.files().get_media(fileId=file_id)
 
-    file_path = os.path.join(output_dir, file_name)
+    file_path = os.path.join(output_dir, local_name_for(file_id, file_name))
 
     fh = io.FileIO(file_path, "wb")
 
