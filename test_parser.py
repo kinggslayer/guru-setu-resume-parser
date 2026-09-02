@@ -341,17 +341,27 @@ def test_only_real_failures_are_remembered():
     """Suppressing a duplicate or a same-person skip would lose candidates."""
 
     check("kept rows are not recorded", reason_for({"keep": True}) is None)
+
+    # Recorded: these can never produce a new candidate, so re-reading the
+    # file on every future run is pure waste.
     check(
-        "duplicates are not recorded",
-        reason_for({"duplicate_of_content": True}) is None,
+        "identical text IS recorded",
+        reason_for({"duplicate_of_content": True}) is not None,
     )
     check(
-        "same-person skips are not recorded",
-        reason_for({"skipped_existing_contact": True}) is None,
+        "already-in-master IS recorded",
+        reason_for({"already_in_master": True}) is not None,
     )
     check(
         "scans are recorded",
         reason_for({"needs_ocr": True, "extraction_failed": True}) is not None,
+    )
+
+    # NOT recorded: which copy won is an accident of processing order, so
+    # suppressing the loser would make results order-dependent.
+    check(
+        "a repeat within one run is not recorded",
+        reason_for({"skipped_existing_contact": True}) is None,
     )
 
 

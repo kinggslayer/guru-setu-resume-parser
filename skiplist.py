@@ -88,9 +88,22 @@ def reason_for(result):
     if result.get("keep"):
         return None
 
-    if result.get("duplicate_of_content"):
-        return None
+    # These two DO get recorded, unlike a "keep".
+    #
+    # A file whose person is already in the master, or whose text matches
+    # another resume, can never produce a new candidate — so downloading
+    # and reading it again on every future run is pure waste. Recorded
+    # separately from real failures so "Retry files that failed before"
+    # brings them back if a master row is ever deleted.
+    if result.get("already_in_master"):
+        return "already in the master (same person)"
 
+    if result.get("duplicate_of_content"):
+        return "identical text to another resume"
+
+    # A repeat WITHIN one run is not recorded: which copy won is an
+    # accident of ordering, and suppressing the loser would make the
+    # result depend on the order files happened to be processed in.
     if result.get("skipped_existing_contact"):
         return None
 

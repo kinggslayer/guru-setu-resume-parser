@@ -342,6 +342,37 @@ def already_seen(df):
     return values(SOURCE_FILE_ID), values(CONTENT_HASH)
 
 
+def known_contacts(df):
+    """
+    Every phone and email already in the master.
+
+    Used to skip a resume BEFORE the OpenAI call. The file-id check only
+    catches the same file; the same person arriving in a different file was
+    parsed in full and then discarded at merge — the most expensive way
+    possible to learn nothing.
+    """
+
+    if df.empty:
+        return set(), set()
+
+    phones = set()
+    emails = set()
+
+    for _, row in df.iterrows():
+
+        mobile = _mobile(cell(row, "Phone"))
+
+        if mobile:
+            phones.add(mobile)
+
+        email = cell(row, "Email").lower()
+
+        if email:
+            emails.add(email)
+
+    return phones, emails
+
+
 def to_master_rows(records):
     """Parsed records -> master rows (portal columns plus tracking)."""
 

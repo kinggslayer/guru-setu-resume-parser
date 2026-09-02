@@ -67,11 +67,22 @@ def load_jobs(folder_id):
     return data if isinstance(data, list) else []
 
 
+class QueueError(Exception):
+    """A queue write failed, carrying Drive's own reason."""
+
+
 def save_jobs(folder_id, jobs):
-    """Write the queue back. False if it didn't land."""
+    """
+    Write the queue back.
+
+    Raises QueueError with Drive's message rather than returning a bare
+    False. "Could not write to the queue file" told the user nothing —
+    the actual cause is almost always a permission that can be fixed in
+    ten seconds once it's named.
+    """
 
     if not folder_id:
-        return False
+        raise QueueError("No Drive folder to write the queue to.")
 
     try:
         upload_cache_to_drive(
@@ -79,8 +90,25 @@ def save_jobs(folder_id, jobs):
         )
         return True
 
-    except Exception:
-        return False
+    except Exception as e:
+
+        message = str(e)
+
+        if "insufficientFilePermissions" in message or "403" in message:
+            raise QueueError(
+                "The service account can only READ this folder, so it "
+                "can't create the queue file. In Drive: right-click the "
+                "folder -> Share -> change the service account from "
+                "Viewer to Editor."
+            ) from e
+
+        if "404" in message or "notFound" in message:
+            raise QueueError(
+                "Drive can't find that folder. Check the link, and that "
+                "the folder is shared with the service account."
+            ) from e
+
+        raise QueueError(f"Drive refused the write: {message}") from e
 
 
 def add_job(folder_id, folder_link, master_link="", requested_by=""):
@@ -116,8 +144,11 @@ def add_job(folder_id, folder_link, master_link="", requested_by=""):
 
     jobs.append(job)
 
-    if not save_jobs(folder_id, jobs):
-        return None, "Could not write to the queue file in Drive."
+    try:
+        save_jobs(folder_id, jobs)
+
+    except QueueError as e:
+        return None, str(e)
 
     return job, "Queued."
 
@@ -150,10 +181,13 @@ def claim_next_job(folder_id, worker_name=""):
         job["worker"] = worker_name
         job["error"] = ""
 
-        if save_jobs(folder_id, jobs):
+        try:
+            save_jobs(folder_id, jobs)
             return job
 
-        return None
+        except QueueError:
+            # Someone else may have claimed it; try again next poll.
+            return None
 
     return None
 
@@ -178,7 +212,12 @@ def update_job(folder_id, job_id, **fields):
             if fields.get("status") in ("done", "failed"):
                 job["finished_at"] = _now()
 
-            return save_jobs(folder_id, jobs)
+            try:
+                return save_jobs(folder_id, jobs)
+
+            except QueueError:
+                # A progress update is not worth killing a running job for.
+                return False
 
     return False
 

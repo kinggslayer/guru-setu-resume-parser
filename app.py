@@ -31,6 +31,9 @@ from extractor import (
     read_docx,
     extract_resume_data,
     ocr_pdf,
+    extract_phone,
+    extract_email,
+    sanitize_phone,
     MIN_USABLE_CHARS
 )
 
@@ -43,6 +46,7 @@ from master_store import (
     apply_edits,
     SOURCE_FILE_ID,
     already_seen,
+    known_contacts,
     to_master_rows,
     merge_into_master,
     strip_tracking,
@@ -921,7 +925,16 @@ def hash_text(text):
     normalized = " ".join(text.split()).lower()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
-def process_resume(file_info, output_dir, existing_hashes):
+def localmobile(value):
+    """Last 10 digits, matching the portal's rule."""
+
+    digits = "".join(c for c in str(value or "") if c.isdigit())
+
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
+def process_resume(file_info, output_dir, existing_hashes,
+                   known_phones=None, known_emails=None):
     file_id = file_info["id"]
     file_name = file_info["name"]
 
@@ -948,6 +961,25 @@ def process_resume(file_info, output_dir, existing_hashes):
             text = read_docx(file_path)
         else:
             return None
+
+        # Cheapest possible check: the phone and email are already in the
+        # raw text and regex finds them for free. If either belongs to
+        # someone already in the master, this resume is a re-submission of
+        # a known candidate, and the OpenAI call would be pure waste — the
+        # merge discards the result minutes later anyway.
+        early_phone = localmobile(sanitize_phone(extract_phone(text) or ""))
+        early_email = (extract_email(text) or "").strip().lower()
+
+        if (
+            (early_phone and early_phone in (known_phones or set()))
+            or (early_email and early_email in (known_emails or set()))
+        ):
+            return {
+                "skipped_existing_contact": True,
+                "already_in_master": True,
+                "resume_file_name": file_name,
+                "file_id": file_id,
+            }
 
         content_hash = hash_text(text)
 
@@ -1211,6 +1243,10 @@ if run_clicked:
 
     seen_file_ids, seen_hashes = already_seen(master_df)
 
+    # Phones and emails already in the master, so a known candidate in a
+    # new file is skipped before it costs anything.
+    known_phones, known_emails = known_contacts(master_df)
+
     if master_existed:
         source = (
             f"file `{master_file_id}`"
@@ -1405,7 +1441,8 @@ if run_clicked:
         for file_info in [f for f in batch if f.get("uploaded")]:
             process_futures[
                 groq_executor.submit(
-                    process_resume, file_info, output_dir, existing_hashes
+                    process_resume, file_info, output_dir, existing_hashes,
+                        known_phones, known_emails
                 )
             ] = file_info
 
@@ -1418,7 +1455,8 @@ if run_clicked:
 
                 process_futures[
                     groq_executor.submit(
-                        process_resume, file_info, output_dir, existing_hashes
+                        process_resume, file_info, output_dir, existing_hashes,
+                        known_phones, known_emails
                     )
                 ] = file_info
 
@@ -1442,6 +1480,14 @@ if run_clicked:
 
             if "error" in result:
                 st.error(result["error"])
+
+                # Record it, or the file is counted as processed but
+                # appears in no category — the "N unaccounted" gap.
+                results.append({
+                    "read_error": True,
+                    "resume_file_name": result.get("resume_file_name", ""),
+                    "error": result["error"],
+                })
                 continue
 
             if (
@@ -1609,10 +1655,34 @@ if run_clicked:
             for r in batch_results if r.get("keep")
         ]
 
+        # Keepers whose file id did NOT end up in the master were merged
+        # into an existing candidate. They can never add anything, so
+        # record them and skip the download entirely next time.
+        if batch_keepers and SOURCE_FILE_ID in master_df.columns:
+
+            landed = set(
+                master_df[SOURCE_FILE_ID].astype(str).str.strip()
+            )
+
+            for record in batch_keepers:
+
+                file_id = str(record.get("file_id") or "").strip()
+
+                if file_id and file_id not in landed:
+                    previously_failed[file_id] = (
+                        "merged into an existing candidate"
+                    )
+
+            save_failed(folder_id, previously_failed)
+
         tally["added"] += batch_added
         tally["already_in_master"] += batch_already_known
+        tally["already_in_master"] += sum(
+            1 for r in batch_results if r.get("already_in_master")
+        )
         tally["same_person_this_run"] += sum(
-            1 for r in batch_results if r.get("skipped_existing_contact")
+            1 for r in batch_results
+            if r.get("skipped_existing_contact") and not r.get("already_in_master")
         )
         tally["identical_text"] += sum(
             1 for r in batch_results if r.get("duplicate_of_content")
@@ -1622,6 +1692,7 @@ if run_clicked:
             1 for r in batch_results
             if r.get("extraction_failed") and not r.get("needs_ocr")
         )
+        tally["failed"] += sum(1 for r in batch_results if r.get("read_error"))
 
         accounted = sum(tally.values())
 
@@ -1705,7 +1776,7 @@ if run_clicked:
 
     unique_results = [
         r for r in results
-        if r.get("keep")
+        if r.get("keep") and not r.get("read_error")
     ]
 
     st.write(
