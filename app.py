@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import io
 import shutil
+import time
 import hashlib
 
 import pandas as pd
@@ -29,6 +30,8 @@ from extractor import (
     ocr_pdf,
     MIN_USABLE_CHARS
 )
+
+from portal_export import to_portal_dataframe
 
 from master_store import (
     extract_file_id,
@@ -263,6 +266,13 @@ def master_file_id_for_save():
 # whole frame is sent to the browser, and a few thousand rows of a
 # 30-column editor stalls it.
 PREVIEW_ROW_LIMIT = 300
+
+# A batch is saved before the next one is parsed. If the save keeps
+# failing the run stops rather than spending money on results that cannot
+# be stored — but a single dropped connection shouldn't end a long run,
+# hence the retries.
+SAVE_ATTEMPTS = 3
+SAVE_RETRY_DELAY = 3
 
 
 def render_review_and_download(state_key, file_name, heading):
@@ -1237,8 +1247,26 @@ if st.button("Process Resumes"):
     # next starts, so a crash costs at most one batch of OpenAI calls.
     batch_size = max(int(get_secret("BATCH_SIZE", 25) or 25), 1)
 
+    if total > batch_size:
+        st.info(
+            f"Processing {total} files in batches of {batch_size}. Progress "
+            "is saved after each batch, so closing this tab or reloading "
+            "stops the run but keeps everything already saved — re-run the "
+            "same folder and it continues from there. Only the batch in "
+            "flight is lost."
+        )
+
     overall_progress = st.progress(0.0)
     status = st.empty()
+
+    # Live results, batch by batch.
+    #
+    # A long run otherwise shows only a moving progress bar, and there is
+    # no way to tell whether it is producing sensible candidates or 1600
+    # rows of nothing until the very end.
+    batch_log = []
+    batch_log_area = st.empty()
+    latest_rows_area = st.empty()
 
     processed_count = 0
     saved_total = 0
@@ -1354,12 +1382,24 @@ if st.button("Process Resumes"):
 
         # Remember what produced nothing, so the next run doesn't pay to
         # parse it again.
+        new_failures = 0
+
         for record in batch_results:
 
             reason = reason_for(record)
 
             if reason and record.get("file_id"):
                 previously_failed[str(record["file_id"])] = reason
+                new_failures += 1
+
+        # Persist the skip list per batch, alongside the master.
+        #
+        # Saving it only at the end meant a reload — or a container kill —
+        # threw away every failure recorded so far, and the next run paid
+        # to parse those same broken files again. Failures are exactly the
+        # files it is most expensive to retry, OCR included.
+        if new_failures:
+            save_failed(folder_id, previously_failed)
 
         if batch_keepers:
 
@@ -1368,20 +1408,103 @@ if st.button("Process Resumes"):
                     master_df, to_master_rows(batch_keepers)
                 )
 
-                save_master(folder_id, master_df, master_file_id)
-
-                status.write(
-                    f"Saved: {len(master_df)} candidates in the master. "
-                    f"{processed_count} of {total} files done."
-                )
-
             except Exception as e:
+                st.error(f"Could not merge this batch: {e}")
+                st.stop()
+
+            # Save before parsing anything else. Retry first, because a
+            # dropped connection to Drive is usually momentary and losing
+            # a whole run to one blip would be wasteful.
+            saved_ok = False
+            last_save_error = None
+
+            for attempt in range(SAVE_ATTEMPTS):
+
+                try:
+                    save_master(folder_id, master_df, master_file_id)
+                    saved_ok = True
+                    break
+
+                except Exception as e:
+                    last_save_error = e
+
+                    if attempt < SAVE_ATTEMPTS - 1:
+                        status.write(
+                            f"Save failed ({e}). Retrying in "
+                            f"{SAVE_RETRY_DELAY * (attempt + 1)}s..."
+                        )
+                        time.sleep(SAVE_RETRY_DELAY * (attempt + 1))
+
+            if not saved_ok:
+                # STOP. Continuing would parse and pay for batch after
+                # batch that cannot be stored — the expensive half of the
+                # work with none of the benefit.
                 st.error(
-                    f"Could not save after this batch: {e} "
-                    "Processing continues, but stop and fix this — later "
-                    "batches may be lost too."
+                    f"Could not save to the master database after "
+                    f"{SAVE_ATTEMPTS} attempts: {last_save_error}\n\n"
+                    f"**Stopped at {processed_count} of {total} files** so "
+                    "no more money is spent on results that can't be "
+                    "stored. Everything saved by earlier batches is safe.\n\n"
+                    "The usual cause is the folder or master file being "
+                    "shared with the service account as Viewer rather than "
+                    "Editor. Fix that and re-run — the files already done "
+                    "will be skipped."
                 )
 
+                st.session_state["master_df"] = master_df
+                render_bottom_panels()
+                st.stop()
+
+            status.write(
+                f"Saved: {len(master_df)} candidates in the master. "
+                f"{processed_count} of {total} files done."
+            )
+
+        # Log every batch, including ones that produced nothing — a run of
+        # empty batches is exactly the signal worth seeing early.
+        batch_number = batch_start // batch_size + 1
+        total_batches = (total + batch_size - 1) // batch_size
+
+        names = [
+            blank_safe(r.get("full_name")) or "(no name)"
+            for r in batch_results if r.get("keep")
+        ]
+
+        batch_log.append({
+            "Batch": f"{batch_number}/{total_batches}",
+            "Files": len(batch_results),
+            "New": len(batch_keepers),
+            "Skipped": len(batch_results) - len(batch_keepers),
+            "Master total": len(master_df),
+            "Names": ", ".join(names[:6]) + ("..." if len(names) > 6 else ""),
+        })
+
+        # Newest first: on a long run the interesting row is the last one,
+        # and scrolling to the bottom of a growing table every time is
+        # needless work.
+        batch_log_area.dataframe(
+            pd.DataFrame(batch_log[::-1]),
+            width="stretch",
+            hide_index=True
+        )
+
+        if batch_keepers:
+
+            preview = to_portal_dataframe(batch_keepers)
+
+            if not preview.empty:
+                latest_rows_area.dataframe(
+                    preview[[
+                        c for c in ["Full Name", "Phone", "Email", "City",
+                                    "Subjects", "Qualification"]
+                        if c in preview.columns
+                    ]],
+                    width="stretch",
+                    hide_index=True
+                )
+
+    # Backstop: batches already saved this, but the last one may not have
+    # recorded a failure.
     if previously_failed:
         save_failed(folder_id, previously_failed)
 
